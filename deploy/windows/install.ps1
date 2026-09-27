@@ -17,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'  # much faster downloads in Windows PowerShell
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $AppTask = 'ORA-ITSM'
 $CaddyTask = 'ORA-ITSM-Caddy'
@@ -55,10 +56,40 @@ try {
 Step 'Downloading Caddy (web server with automatic HTTPS)'
 New-Item -ItemType Directory -Force -Path $CaddyDir, (Join-Path $CaddyDir 'data') | Out-Null
 $caddy = Join-Path $CaddyDir 'caddy.exe'
-if (-not (Test-Path $caddy)) {
-  Invoke-WebRequest -UseBasicParsing -Uri 'https://caddyserver.com/api/download?os=windows&arch=amd64' -OutFile $caddy
+
+# A valid Windows executable starts with "MZ" and Caddy is larger than 10 MB
+function Test-Executable([string]$Path) {
+  if (-not (Test-Path $Path)) { return $false }
+  if ((Get-Item $Path).Length -lt 10MB) { return $false }
+  $stream = [IO.File]::OpenRead($Path)
+  try { return ($stream.ReadByte() -eq 0x4D -and $stream.ReadByte() -eq 0x5A) } finally { $stream.Close() }
+}
+
+if (-not (Test-Executable $caddy)) {
+  if (Test-Path $caddy) { Write-Host 'Removing an invalid caddy.exe from a previous attempt'; Remove-Item $caddy -Force }
+  $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+  $caddyArch = if ($arch -eq 'ARM64') { 'arm64' } else { 'amd64' }
+  Write-Host "Processor architecture: $arch -> Caddy windows_$caddyArch"
+  $url = $null
+  try {
+    $release = Invoke-RestMethod -UseBasicParsing -Uri 'https://api.github.com/repos/caddyserver/caddy/releases/latest'
+    $url = ($release.assets | Where-Object { $_.name -like "caddy_*_windows_$caddyArch.zip" } | Select-Object -First 1).browser_download_url
+  } catch { Write-Host 'GitHub API unavailable, using a known Caddy version' }
+  if (-not $url) { $url = "https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_windows_$caddyArch.zip" }
+  Write-Host "Downloading $url"
+  $zip = Join-Path $env:TEMP 'caddy-download.zip'
+  $extract = Join-Path $env:TEMP 'caddy-download'
+  Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+  if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+  Expand-Archive -Path $zip -DestinationPath $extract -Force
+  Copy-Item (Join-Path $extract 'caddy.exe') $caddy -Force
+  Remove-Item $zip, $extract -Recurse -Force -ErrorAction SilentlyContinue
+  if (-not (Test-Executable $caddy)) {
+    throw "Caddy download failed. Download the Windows zip manually from https://github.com/caddyserver/caddy/releases, put caddy.exe in $CaddyDir and run this script again."
+  }
 }
 & $caddy version
+if ($LASTEXITCODE -ne 0) { throw 'caddy.exe cannot run on this server' }
 
 Step "Writing Caddy configuration for https://$Domain"
 $caddyPath = $CaddyDir -replace '\\', '/'
