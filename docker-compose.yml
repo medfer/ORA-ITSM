@@ -1,0 +1,18 @@
+services:
+  ora-itsm:
+    build: .
+    image: ora-itsm:latest
+    container_name: ora-itsm
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: Asia/Baghdad
+      # Compte administrateur créé au premier démarrage uniquement
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@ora-itsm.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ChangeMe!2026}
+    volumes:
+      - ora-data:/data
+
+volumes:
+  ora-data:

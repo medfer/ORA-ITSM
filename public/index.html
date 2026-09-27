@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ORA ITSM</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpath d='M9 11h14M9 16h14M9 21h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login" class="login hidden">
+    <form id="login-form" class="login-card">
+      <div class="brand big"><span class="logo">▤</span> ORA ITSM</div>
+      <p class="muted">Support Microsoft — gestion des incidents, SLA et temps</p>
+      <label>Email<input name="email" type="email" autocomplete="username" required></label>
+      <label>Mot de passe<input name="password" type="password" autocomplete="current-password" required></label>
+      <div id="login-error" class="error"></div>
+      <button class="btn primary" type="submit">Se connecter</button>
+    </form>
+  </div>
+
+  <div id="app" class="app hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="logo">▤</span> ORA ITSM</div>
+      <nav id="nav">
+        <a href="#/dashboard" data-route="dashboard">Tableau de bord</a>
+        <a href="#/tickets" data-route="tickets">Tickets</a>
+        <a href="#/time" data-route="time" data-staff>Temps passé</a>
+        <a href="#/reports" data-route="reports">Rapports</a>
+        <a href="#/settings" data-route="settings" data-admin>Paramètres</a>
+      </nav>
+      <div class="me">
+        <div id="me-name"></div>
+        <div class="muted small" id="me-role"></div>
+        <div class="me-actions">
+          <button class="link" id="btn-password">Mot de passe</button> ·
+          <button class="link" id="btn-logout">Déconnexion</button>
+        </div>
+      </div>
+    </aside>
+    <main id="view" class="view"></main>
+  </div>
+
+  <div id="modal" class="modal hidden"><div class="modal-card" id="modal-card"></div></div>
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

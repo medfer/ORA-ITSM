@@ -1,0 +1,18 @@
+{
+  "name": "ora-itsm",
+  "version": "1.0.0",
+  "description": "ITSM léger pour le contrat de support Microsoft ORA : tickets, incidents, SLA, temps passé et reporting",
+  "main": "server/index.js",
+  "private": true,
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
