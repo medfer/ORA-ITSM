@@ -1,0 +1,16 @@
+# Caddy obtains and renews the Let's Encrypt certificate for {$DOMAIN} automatically.
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	request_body {
+		max_size 25MB
+	}
+	reverse_proxy ora-itsm:8080
+}

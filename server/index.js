@@ -20,6 +20,8 @@ const TYPES = ['incident', 'request', 'change', 'problem'];
 
 const app = express();
 app.disable('x-powered-by');
+// Behind Caddy / a reverse proxy: use the real client IP (login rate limiting)
+app.set('trust proxy', process.env.TRUST_PROXY || 'loopback, linklocal, uniquelocal');
 app.use((req, res, next) => {
   res.set('X-Content-Type-Options', 'nosniff');
   res.set('X-Frame-Options', 'DENY');
@@ -107,14 +109,14 @@ const requireRole = (...roles) => (req, _res, next) =>
 const staff = requireRole('admin', 'engineer');
 const admin = requireRole('admin');
 
-function openSession(res, user) {
+function openSession(res, user, extra = {}) {
   const now = Date.now();
   const token = crypto.randomBytes(32).toString('hex');
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
   db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
     .run(token, user.id, now + SESSION_DAYS * 86400000);
   db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, user.id);
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role }, ...extra });
 }
 
 app.post('/api/login', wrap((req, res) => {
@@ -136,7 +138,7 @@ app.post('/api/login', wrap((req, res) => {
   if (!sso.normalizeConfig(getSettings().sso).password_login && user.role !== 'admin') {
     throw new HttpError(403, 'Please use "Sign in with Microsoft"');
   }
-  openSession(res, user);
+  openSession(res, user, { weak_password: String(password) === 'ChangeMe!2026' || String(password).length < 8 });
 }));
 
 // Public: what the login page needs to start the Microsoft sign-in

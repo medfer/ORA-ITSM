@@ -1,0 +1,17 @@
+# Windows Server: run "caddy run --config Caddyfile.windows" next to caddy.exe
+# Replace the domain and email below. Node.js must be running ORA ITSM on port 8080.
+{
+	email you@your-company.com
+}
+
+itsm.your-domain.com {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+	request_body {
+		max_size 25MB
+	}
+	reverse_proxy 127.0.0.1:8080
+}

@@ -313,6 +313,10 @@ async function signedIn(r) {
   state.user = r.user;
   state.meta = await api('/meta');
   showApp();
+  if (r.weak_password) {
+    toast('You are using the default password: please change it now', true);
+    $('#btn-password').click();
+  }
 }
 
 function showApp() {

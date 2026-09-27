@@ -70,17 +70,48 @@ Useful commands:
 | Update | `git pull && docker compose up -d --build` |
 | Backup | `./scripts/backup.sh /srv/backups/ora-itsm` (keeps the last 30) |
 
-### HTTPS (recommended)
+### Publish on the Internet with a domain and HTTPS
 
-Put a reverse proxy in front, e.g. Caddy (automatic Let's Encrypt certificate):
+You need: a server with a fixed public IP, a domain name, and ports **80** and **443** open.
+The SSL certificate is **free** (Let's Encrypt) and obtained / renewed automatically by [Caddy](https://caddyserver.com).
 
+**1. Domain (DNS)** — at your domain registrar, create an **A record**:
+
+| Type | Name | Value | TTL |
+|---|---|---|---|
+| A | `itsm` | `<your fixed IP>` | 3600 |
+
+→ `itsm.your-domain.com` points to the server. Check with `nslookup itsm.your-domain.com`.
+
+**2. Firewall / router** — allow TCP **80** and **443** inbound to the server
+(if the server is behind a router, forward ports 80 and 443 to its local IP). Do **not** expose port 8080.
+
+**3a. Linux server with Docker (recommended)**
+
+```bash
+git clone -b claude/loving-bardeen-ltstxx https://github.com/medfer/ora-itsm.git /opt/ora-itsm
+cd /opt/ora-itsm
+cp .env.example .env
+nano .env        # set DOMAIN, ACME_EMAIL, ADMIN_EMAIL, ADMIN_PASSWORD
+docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml logs -f caddy   # wait for "certificate obtained successfully"
 ```
-itsm.your-domain.com {
-    reverse_proxy 127.0.0.1:8080
-}
-```
 
-and restrict the port in `docker-compose.yml` to `"127.0.0.1:8080:8080"`.
+Open `https://itsm.your-domain.com`. Updates: `git pull && docker compose -f docker-compose.prod.yml up -d --build`.
+
+**3b. Windows Server (without Docker)**
+
+1. Install Node.js 22 LTS, copy the project to `C:\ora-itsm`, run `npm install --omit=dev`.
+2. Run ORA ITSM as a Windows service with [NSSM](https://nssm.cc):
+   `nssm install ORA-ITSM "C:\Program Files\nodejs\node.exe" "--env-file-if-exists=.env --disable-warning=ExperimentalWarning server\index.js"`,
+   set *Startup directory* to `C:\ora-itsm`, then `nssm start ORA-ITSM`.
+3. Download `caddy.exe` (https://caddyserver.com/download, Windows amd64) into `C:\caddy`, copy `deploy\Caddyfile.windows` there as `Caddyfile`,
+   replace the domain and email, and install it as a service too:
+   `nssm install Caddy C:\caddy\caddy.exe "run --config C:\caddy\Caddyfile"` then `nssm start Caddy`.
+4. Windows Firewall: allow inbound TCP 80 and 443
+   (`New-NetFirewallRule -DisplayName "HTTP/HTTPS" -Direction Inbound -Protocol TCP -LocalPort 80,443 -Action Allow`).
+
+**Before giving access to the client:** change the admin password, create the user accounts, and schedule backups.
 
 ## Sign in with Microsoft (Entra ID SSO)
 

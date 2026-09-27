@@ -1,0 +1,39 @@
+# Production: ORA ITSM behind Caddy with automatic HTTPS (Let's Encrypt).
+# Usage: set DOMAIN and ACME_EMAIL in .env, then
+#   docker compose -f docker-compose.prod.yml up -d --build
+services:
+  ora-itsm:
+    build: .
+    image: ora-itsm:latest
+    container_name: ora-itsm
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Baghdad
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@ora-itsm.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-ChangeMe!2026}
+    volumes:
+      - ora-data:/data
+    # No published port: only Caddy can reach the application
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ora-caddy
+    restart: unless-stopped
+    depends_on:
+      - ora-itsm
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env (e.g. itsm.example.com)}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  ora-data:
+  caddy-data:
+  caddy-config:
