@@ -1,6 +1,6 @@
 #!/bin/sh
 # Hot backup of the container SQLite database and attachments (schedule it with cron, e.g. nightly).
-# Usage: ./scripts/backup.sh [dossier_destination]
+# Usage: ./scripts/backup.sh [destination_folder]
 set -e
 DEST="${1:-./backups}"
 mkdir -p "$DEST"
