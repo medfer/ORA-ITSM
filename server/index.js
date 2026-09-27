@@ -220,7 +220,7 @@ app.get('/api/meta', wrap((req, res) => {
     open_statuses: OPEN_STATUSES,
     types: TYPES,
     policies: Object.values(policies()),
-    users: db.prepare('SELECT id, name, role FROM users WHERE active = 1 ORDER BY name').all(),
+    users: db.prepare(`SELECT id, name, role${req.user.role === 'client' ? '' : ', email'} FROM users WHERE active = 1 ORDER BY name`).all(),
     max_upload_mb: MAX_UPLOAD_MB,
   });
 }));

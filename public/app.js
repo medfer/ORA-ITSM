@@ -236,6 +236,7 @@ function openModal(html, onSubmit) {
   $('#modal').classList.remove('hidden');
   const form = $('form', card);
   $$('[data-close]', card).forEach((b) => b.addEventListener('click', closeModal));
+  if (form) bindClientPicker(form);
   if (form && onSubmit) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -817,8 +818,28 @@ async function renderTickets() {
   await reload();
 }
 
+// Staff: choose a client account to fill the requester (so the client receives the emails)
+function clientPicker() {
+  const clients = state.meta.users.filter((u) => u.role === 'client' && u.email);
+  if (!clients.length) return '';
+  return `<label class="full">Client account <span class="hint">— fills the requester; the client receives the email notifications</span>
+    <select data-client-pick>${options(clients.map((u) => [u.id, `${u.name} <${u.email}>`]), '', '— choose a client —')}</select></label>`;
+}
+
+function bindClientPicker(form) {
+  const pick = $('[data-client-pick]', form);
+  if (!pick) return;
+  pick.addEventListener('change', () => {
+    const u = state.meta.users.find((x) => String(x.id) === pick.value);
+    if (!u) return;
+    $('[name=requester_name]', form).value = u.name;
+    $('[name=requester_email]', form).value = u.email;
+  });
+}
+
 function newTicketModal() {
   const staffFields = isStaff() ? `
+      ${clientPicker()}
       <label>Requester<input name="requester_name"></label>
       <label>Requester email<input name="requester_email" type="email"></label>
       <label>Assign to<select name="assignee_id">${options(staffOptions(), state.user.role === 'engineer' ? state.user.id : '', 'Unassigned')}</select></label>
@@ -1077,6 +1098,7 @@ function editTicketModal(t, preset = {}) {
       <label>Assignee<select name="assignee_id">${options(staffOptions(), v.assignee_id, 'Unassigned')}</select></label>
       <label>Category<select name="category">${options([...new Set([...(state.meta.settings.categories || []), v.category].filter(Boolean))].map((c) => [c, c]), v.category, '—')}</select></label>
       <label>Microsoft case no.<input name="ms_case" value="${esc(v.ms_case)}"></label>
+      ${clientPicker()}
       <label>Requester<input name="requester_name" value="${esc(v.requester_name)}"></label>
       <label>Requester email<input name="requester_email" type="email" value="${esc(v.requester_email)}"></label>
       <label class="full">Description<textarea name="description" rows="5">${esc(v.description)}</textarea></label>
@@ -1263,6 +1285,7 @@ const MAIL_EVENTS = {
     ['staff_client_reply', 'Client replies'],
     ['staff_sla', 'SLA at risk / breached (assignee + admins)'],
     ['staff_allowance', 'Monthly allowance alerts (admins)'],
+    ['copy_self', 'Also email the person who made the change (useful for testing)'],
   ],
 };
 
@@ -1362,8 +1385,8 @@ async function renderSettings() {
         </div>
         <h3 style="margin-top:18px">Recent emails</h3>
         ${emailLog.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>To</th><th>Subject</th><th>Status</th></tr></thead><tbody>
-          ${emailLog.slice(0, 15).map((e) => `<tr><td class="nowrap small">${fmtDate(e.created_at)}</td><td class="small">${esc(e.event)}</td><td class="small">${esc(e.recipients)}</td>
-            <td class="small">${esc(e.subject)}</td><td>${e.status === 'sent' ? badge('Sent', 'ok') : `<span title="${esc(e.error || '')}">${badge('Failed', 'bad')}</span><div class="small muted">${esc((e.error || '').slice(0, 120))}</div>`}</td></tr>`).join('')}
+          ${emailLog.slice(0, 15).map((e) => `<tr><td class="nowrap small">${fmtDate(e.created_at)}</td><td class="small">${esc(e.event)}</td><td class="small">${esc(e.recipients || '—')}</td>
+            <td class="small">${esc(e.subject)}</td><td>${e.status === 'sent' ? badge('Sent', 'ok') : e.status === 'skipped' ? `${badge('Not sent', 'plain')}<div class="small muted">${esc(e.error || '')}</div>` : `<span title="${esc(e.error || '')}">${badge('Failed', 'bad')}</span><div class="small muted">${esc((e.error || '').slice(0, 120))}</div>`}</td></tr>`).join('')}
         </tbody></table></div>` : emptyState('No emails sent yet')}
       </div>
 

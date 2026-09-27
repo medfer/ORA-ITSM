@@ -58,7 +58,10 @@ function adminRecipients() {
   return db.prepare("SELECT email FROM users WHERE active = 1 AND notify = 1 AND role = 'admin'").all().map((u) => u.email);
 }
 
-const without = (list, actor) => list.filter((e) => !actor || e.toLowerCase() !== String(actor.email || '').toLowerCase());
+// The person who made the change is not emailed, unless "copy_self" is enabled (useful for testing)
+const without = (list, actor) => (mailer.mailConfig().events.copy_self
+  ? list
+  : list.filter((e) => !actor || e.toLowerCase() !== String(actor.email || '').toLowerCase()));
 
 // ---------- template ----------
 
@@ -97,12 +100,24 @@ function ticketRows(t, settings, extra = []) {
   ];
 }
 
+const SKIP_REASON = {
+  client_ticket_created: 'No client email: the ticket has no requester email (or it is your own address / notifications are off)',
+  client_status_changed: 'No client email: the ticket has no requester email, or the client turned notifications off',
+  client_staff_reply: 'No client email: the ticket has no requester email, or the client turned notifications off',
+  staff_new_ticket: 'No team recipient other than the person who created the ticket',
+  staff_assigned: 'The engineer assigned the ticket to themselves, or turned notifications off',
+  staff_client_reply: 'No engineer to notify',
+};
+
 function send(event, t, to, subject, body) {
   try {
     const settings = getSettings();
     const cfg = mailer.mailConfig(settings.mail);
     if (!cfg.enabled) return;
-    mailer.enqueue({ event, ticketId: t?.id, to, subject: `[${t ? number(t, settings) : settings.client_name}] ${subject}`, html: layout(settings, cfg, { ...body, ticket: t }) });
+    const fullSubject = `[${t ? number(t, settings) : settings.client_name}] ${subject}`;
+    if (!mailer.enqueue({ event, ticketId: t?.id, to, subject: fullSubject, html: layout(settings, cfg, { ...body, ticket: t }) })) {
+      mailer.logSkipped(event, t?.id, fullSubject, SKIP_REASON[event] || 'No recipient');
+    }
   } catch (e) {
     console.error('[ora-itsm] notification error:', e.message);
   }

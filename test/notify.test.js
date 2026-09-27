@@ -142,3 +142,24 @@ test('SLA and allowance alerts are sent once', async () => {
   await call('POST', '/time', { work_date: today, minutes: 30, description: 'Extra' }, admin);
   assert.strictEqual((await drain()).length, 0);
 });
+
+test('skipped notifications are logged; copy_self sends to the actor', async () => {
+  const cfg = (await call('GET', '/settings/mail', null, admin)).body;
+  // Admin creates a ticket without requester email: client email skipped, visible in the log
+  const t = (await call('POST', '/tickets', { title: 'No requester', priority: 'P3' }, admin)).body;
+  await drain();
+  const log = (await call('GET', '/admin/email-log', null, admin)).body;
+  const skipped = log.find((e) => e.ticket_id === t.id && e.status === 'skipped' && e.event === 'client_ticket_created');
+  assert.ok(skipped, 'skipped entry logged');
+  assert.match(skipped.error, /requester email/);
+
+  await call('PUT', '/settings/mail', { ...cfg, events: { ...cfg.events, copy_self: true } }, admin);
+  await call('POST', '/tickets', { title: 'Copy to me', priority: 'P3' }, admin);
+  const mails = await drain();
+  assert.ok(to(mails, 'admin@test.local').length >= 1);
+  await call('PUT', '/settings/mail', { ...cfg, events: { ...cfg.events, copy_self: false } }, admin);
+
+  // Staff see user emails (client picker); clients do not
+  assert.ok((await call('GET', '/meta', null, engineer)).body.users.some((u) => u.email === 'it@ora.iq'));
+  assert.ok((await call('GET', '/meta', null, client)).body.users.every((u) => u.email === undefined));
+});

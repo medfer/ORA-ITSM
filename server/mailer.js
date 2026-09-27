@@ -21,6 +21,7 @@ const DEFAULT_MAIL = {
     staff_client_reply: true,
     staff_sla: true,
     staff_allowance: true,
+    copy_self: false,
   },
 };
 
@@ -131,6 +132,10 @@ async function processQueue() {
   }
 }
 
+function logSkipped(event, ticketId, subject, reason) {
+  logEmail({ event, ticketId, to: [], subject }, 'skipped', reason);
+}
+
 // Queue an email; returns immediately. Invalid/duplicate recipients are dropped.
 function enqueue({ event, ticketId, to, subject, html }) {
   const recipients = [...new Set((to || []).map((e) => String(e || '').trim().toLowerCase()).filter((e) => EMAIL.test(e)))];
@@ -163,6 +168,7 @@ module.exports = {
   mailConfig,
   configProblem,
   enqueue,
+  logSkipped,
   sendNow,
   // tests only
   _setTransport(fn) { transport = fn || graphTransport; },
