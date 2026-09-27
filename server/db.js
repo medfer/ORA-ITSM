@@ -178,6 +178,21 @@ function seed() {
   const rename = db.prepare('UPDATE sla_policies SET name = ? WHERE priority = ? AND name = ?');
   for (const [p, name] of DEFAULT_SLA) rename.run(name, p, legacy[p]);
 
+  // Databases created by the first (French) version: translate untouched default values
+  db.prepare("UPDATE users SET name = 'Administrator' WHERE name = 'Administrateur'").run();
+  const legacyCategories = { 'Sécurité / Defender': 'Security / Defender', Licences: 'Licensing', Autre: 'Other' };
+  const renameCategory = db.prepare('UPDATE tickets SET category = ? WHERE category = ?');
+  for (const [fr, en] of Object.entries(legacyCategories)) renameCategory.run(en, fr);
+  const stored = (key) => {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    try { return row ? JSON.parse(row.value) : undefined; } catch { return undefined; }
+  };
+  const categories = stored('categories');
+  if (Array.isArray(categories) && categories.some((c) => legacyCategories[c])) {
+    setSetting('categories', categories.map((c) => legacyCategories[c] || c));
+  }
+  if (stored('contract_name') === 'Support Microsoft ORA') setSetting('contract_name', 'ORA Microsoft Support');
+
   const { n } = db.prepare('SELECT COUNT(*) AS n FROM users').get();
   if (n === 0) {
     const email = process.env.ADMIN_EMAIL || 'admin@ora-itsm.local';
