@@ -136,6 +136,18 @@ node server/reset-password.js admin@ora-itsm.local "NewPassword2026"   # reset (
 docker compose exec ora-itsm node server/reset-password.js admin@ora-itsm.local 'NewPassword2026'
 ```
 
+## Create accounts from the command line
+
+Accounts are normally created in **Settings → Users**. From a terminal (stop the app first on Windows):
+
+```bash
+node server/add-user.js it@ora.iq "OraClient!2026" client "ORA IT Team"
+node server/add-user.js engineer@blackstar.iq "Engineer!2026" engineer "Engineer Name"
+
+# with Docker:
+docker compose exec ora-itsm node server/add-user.js it@ora.iq 'OraClient!2026' client 'ORA IT Team'
+```
+
 ## Backup & restore
 
 - **From the app:** Settings → Database & backup → **Download backup** (consistent copy even while running).
