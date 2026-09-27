@@ -118,6 +118,24 @@ const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name)
 if (!userCols.includes('entra_oid')) db.exec('ALTER TABLE users ADD COLUMN entra_oid TEXT');
 if (!userCols.includes('last_login_at')) db.exec('ALTER TABLE users ADD COLUMN last_login_at INTEGER');
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_entra_oid ON users(entra_oid) WHERE entra_oid IS NOT NULL');
+if (!userCols.includes('notify')) db.exec('ALTER TABLE users ADD COLUMN notify INTEGER NOT NULL DEFAULT 1');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS email_log (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at INTEGER NOT NULL,
+  event      TEXT NOT NULL,
+  ticket_id  INTEGER,
+  recipients TEXT NOT NULL,
+  subject    TEXT NOT NULL,
+  status     TEXT NOT NULL,
+  error      TEXT
+);
+CREATE TABLE IF NOT EXISTS notification_flags (
+  key        TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL
+);
+`);
 
 const DEFAULT_SETTINGS = {
   company_name: 'Black Star Iraq',
@@ -157,10 +175,20 @@ function verifyPassword(password, stored) {
 
 function getSettings() {
   const out = { ...DEFAULT_SETTINGS };
-  for (const row of db.prepare('SELECT key, value FROM settings').all()) {
+  // Secrets (e.g. the mail client secret) are never part of the settings sent to browsers
+  for (const row of db.prepare("SELECT key, value FROM settings WHERE key NOT LIKE 'secret_%'").all()) {
     try { out[row.key] = JSON.parse(row.value); } catch { /* ignore corrupted value */ }
   }
   return out;
+}
+
+function getSecret(name) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(`secret_${name}`);
+  try { return row ? JSON.parse(row.value) : ''; } catch { return ''; }
+}
+
+function setSecret(name, value) {
+  setSetting(`secret_${name}`, String(value || ''));
 }
 
 function setSetting(key, value) {
@@ -210,5 +238,5 @@ function seed() {
 seed();
 
 module.exports = {
-  db, DATA_DIR, DB_FILE, UPLOAD_DIR, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS,
+  db, DATA_DIR, DB_FILE, UPLOAD_DIR, getSettings, setSetting, getSecret, setSecret, hashPassword, verifyPassword, DEFAULT_SETTINGS,
 };

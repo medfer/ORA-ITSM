@@ -310,7 +310,7 @@ function showLogin(error = '') {
 async function signedIn(r) {
   state.token = r.token;
   store.set('ora_token', r.token);
-  state.user = r.user;
+  state.user = { ...r.user, ...(await api('/me')) };
   state.meta = await api('/meta');
   showApp();
   if (r.weak_password) {
@@ -328,6 +328,7 @@ function showApp() {
   $('#me-avatar').textContent = initials(u.name);
   $('#menu-name').textContent = u.name;
   $('#menu-email').textContent = u.email;
+  updateNotifyButton();
   $('#sidebar-foot').textContent = `${state.meta.settings.company_name} → ${state.meta.settings.client_name}`;
   $$('[data-staff]').forEach((a) => a.classList.toggle('hidden', !isStaff()));
   $$('[data-admin]').forEach((a) => a.classList.toggle('hidden', !isAdmin()));
@@ -377,6 +378,20 @@ $('#btn-microsoft').addEventListener('click', () => {
 });
 
 $('#btn-logout').addEventListener('click', () => logout());
+
+function updateNotifyButton() {
+  $('#btn-notify').textContent = `Email notifications: ${state.user?.notify === 0 ? 'off' : 'on'}`;
+}
+
+$('#btn-notify').addEventListener('click', async () => {
+  const next = state.user.notify === 0;
+  try {
+    await api('/me', { method: 'PATCH', body: { notify: next } });
+    state.user.notify = next ? 1 : 0;
+    updateNotifyButton();
+    toast(`Email notifications ${next ? 'enabled' : 'disabled'}`);
+  } catch (ex) { toast(ex.message, true); }
+});
 
 $('#btn-password').addEventListener('click', () => {
   $('#user-menu').classList.add('hidden');
@@ -1235,12 +1250,28 @@ async function renderReports() {
 
 // ================= settings =================
 
+const MAIL_EVENTS = {
+  client: [
+    ['client_ticket_created', 'Ticket received (confirmation with ticket number)'],
+    ['client_status_changed', 'Status changes: in progress, pending, resolved, closed'],
+    ['client_staff_reply', 'Replies from the support team (internal notes are never sent)'],
+    ['client_allowance', 'Monthly allowance alerts (threshold and 100%)'],
+  ],
+  staff: [
+    ['staff_new_ticket', 'New ticket'],
+    ['staff_assigned', 'Ticket assigned to an engineer'],
+    ['staff_client_reply', 'Client replies'],
+    ['staff_sla', 'SLA at risk / breached (assignee + admins)'],
+    ['staff_allowance', 'Monthly allowance alerts (admins)'],
+  ],
+};
+
 async function renderSettings() {
   if (!isAdmin()) throw new Error('Administrators only');
   await refreshMeta();
   const s = state.meta.settings;
   const bh = s.business_hours || {};
-  const [users, sys] = await Promise.all([api('/users'), api('/admin/system')]);
+  const [users, sys, mail, emailLog] = await Promise.all([api('/users'), api('/admin/system'), api('/settings/mail'), api('/admin/email-log')]);
   const offH = (Number(bh.offset) || 0) / 60;
   const ssoCfg = s.sso;
 
@@ -1284,11 +1315,56 @@ async function renderSettings() {
       <div class="card span-2"><div class="page-head" style="margin-bottom:10px"><h2 style="margin:0">Users</h2><button class="btn primary" id="add-user">+ User</button></div>
         <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Sign-in</th><th>Last sign-in</th><th>Status</th><th></th></tr></thead><tbody>
         ${users.map((u) => `<tr><td><div style="display:flex;align-items:center;gap:10px">${avatar(u.name)}<b>${esc(u.name)}</b></div></td><td>${esc(u.email)}</td><td>${esc(LABELS.role[u.role])}</td>
-          <td>${u.sso_linked ? badge('Microsoft', 'accent') : badge('Password', 'plain')}</td>
+          <td>${u.sso_linked ? badge('Microsoft', 'accent') : badge('Password', 'plain')}${u.notify ? '' : ` ${badge('No emails', 'plain')}`}</td>
           <td class="small muted nowrap">${u.last_login_at ? fmtRelative(u.last_login_at) : 'never'}</td>
           <td>${u.active ? badge('Active', 'ok') : badge('Disabled')}</td><td><button class="link" data-user="${u.id}">Edit</button></td></tr>`).join('')}
         </tbody></table></div>
         <p class="muted small">Roles: <b>Administrator</b> (everything), <b>Engineer</b> (tickets, time, reports), <b>Client</b> (opens and follows their requests, sees reports without internal notes).</p>
+      </div>
+
+      <div class="card span-2" id="mail-card">
+        <div class="card-head"><h2><span class="status-dot ${mail.enabled ? 'on' : ''}"></span>Email notifications (Office 365)</h2>
+          ${mail.enabled ? badge('Enabled', 'ok') : badge('Disabled')}</div>
+        <div class="grid cols-2">
+          <form id="f-mail" class="form-grid">
+            <label class="check full"><input type="checkbox" name="enabled" ${mail.enabled ? 'checked' : ''}> Send email notifications</label>
+            <label class="full">Sender mailbox (Office 365)<input name="sender" type="email" value="${esc(mail.sender)}" placeholder="Med@carthagecloudsolutions.com"></label>
+            <label>Directory (tenant) ID<input name="tenant_id" value="${esc(mail.tenant_id)}" spellcheck="false" placeholder="00000000-0000-0000-0000-000000000000"></label>
+            <label>Application (client) ID<input name="client_id" value="${esc(mail.client_id)}" spellcheck="false" placeholder="00000000-0000-0000-0000-000000000000"></label>
+            <label class="full">Client secret <span class="hint">${mail.secret_set ? '— saved; leave empty to keep it' : '— the secret <b>Value</b> (not the Secret ID)'}</span>
+              <input name="client_secret" type="password" autocomplete="new-password" placeholder="${mail.secret_set ? '•••••••• (saved)' : ''}"></label>
+            <label class="full">Team address <span class="hint">— optional; e.g. a shared support mailbox. Empty = all engineers and admins</span>
+              <input name="staff_email" value="${esc(mail.staff_email)}" placeholder="support@carthagecloudsolutions.com"></label>
+            <label class="full">Public address of ORA ITSM <span class="hint">— used for the “View ticket” links</span>
+              <input name="app_url" value="${esc(mail.app_url || mail.default_app_url)}"></label>
+            <div class="form-section">Notify the client</div>
+            ${MAIL_EVENTS.client.map(([k, l]) => `<label class="check full"><input type="checkbox" data-event="${k}" ${mail.events[k] ? 'checked' : ''}> ${esc(l)}</label>`).join('')}
+            <div class="form-section">Notify the team</div>
+            ${MAIL_EVENTS.staff.map(([k, l]) => `<label class="check full"><input type="checkbox" data-event="${k}" ${mail.events[k] ? 'checked' : ''}> ${esc(l)}</label>`).join('')}
+            <div class="foot full"><button class="btn primary" type="submit">Save email settings</button></div>
+          </form>
+          <div>
+            <h3>Setup in Microsoft Entra (once)</h3>
+            <ol class="steps">
+              <li><b>entra.microsoft.com → App registrations → New registration</b>. Name <i>ORA ITSM Mail</i>, single tenant, no redirect URI.</li>
+              <li><b>API permissions → Add → Microsoft Graph → Application permissions → Mail.Send</b>, then <b>Grant admin consent</b>.</li>
+              <li><b>Certificates &amp; secrets → New client secret</b> (24 months) and copy its <b>Value</b> immediately.</li>
+              <li>Copy the <b>Application (client) ID</b> and <b>Directory (tenant) ID</b> from the Overview page into this form.</li>
+              <li>Recommended: restrict the app to this mailbox only with Exchange Online RBAC for Applications (commands in the README).</li>
+            </ol>
+            <h3 style="margin-top:18px">Send a test email</h3>
+            <form id="f-mail-test" style="display:flex;gap:8px;flex-wrap:wrap">
+              <input name="to" type="email" required value="${esc(state.user.email)}" style="flex:1;min-width:200px">
+              <button class="btn" type="submit">Send test</button>
+            </form>
+            <p class="hint">Save the settings first. Clients receive emails at the address of their account (or the requester email of the ticket). Each user can turn notifications off in their menu.</p>
+          </div>
+        </div>
+        <h3 style="margin-top:18px">Recent emails</h3>
+        ${emailLog.length ? `<div class="table-wrap"><table><thead><tr><th>Date</th><th>Event</th><th>To</th><th>Subject</th><th>Status</th></tr></thead><tbody>
+          ${emailLog.slice(0, 15).map((e) => `<tr><td class="nowrap small">${fmtDate(e.created_at)}</td><td class="small">${esc(e.event)}</td><td class="small">${esc(e.recipients)}</td>
+            <td class="small">${esc(e.subject)}</td><td>${e.status === 'sent' ? badge('Sent', 'ok') : `<span title="${esc(e.error || '')}">${badge('Failed', 'bad')}</span><div class="small muted">${esc((e.error || '').slice(0, 120))}</div>`}</td></tr>`).join('')}
+        </tbody></table></div>` : emptyState('No emails sent yet')}
       </div>
 
       <div class="card span-2" id="sso-card">
@@ -1381,6 +1457,37 @@ async function renderSettings() {
     } catch (ex) { toast(ex.message, true); }
   });
 
+  $('#f-mail').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const events = {};
+    $$('#f-mail [data-event]').forEach((c) => { events[c.dataset.event] = c.checked; });
+    try {
+      await api('/settings/mail', {
+        method: 'PUT',
+        body: {
+          enabled: !!f.get('enabled'), sender: f.get('sender'), tenant_id: f.get('tenant_id'), client_id: f.get('client_id'),
+          client_secret: f.get('client_secret'), staff_email: f.get('staff_email'), app_url: f.get('app_url'), events,
+        },
+      });
+      toast('Email settings saved');
+      renderSettings();
+    } catch (ex) { toast(ex.message, true); }
+  });
+
+  $('#f-mail-test').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('button', e.target);
+    btn.disabled = true;
+    try {
+      const r = await api('/settings/mail/test', { method: 'POST', body: { to: new FormData(e.target).get('to') } });
+      toast(`Test email sent to ${r.to}`);
+      renderSettings();
+    } catch (ex) {
+      toast(ex.message, true);
+    } finally { btn.disabled = false; }
+  });
+
   $('#copy-redirect').addEventListener('click', () => {
     navigator.clipboard?.writeText($('#redirect-uri').textContent).then(() => toast('Redirect URI copied'), () => toast('Copy failed', true));
   });
@@ -1417,6 +1524,7 @@ async function renderSettings() {
       <label>Email<input name="email" type="email" required value="${esc(u?.email || '')}"></label>
       <label>Role<select name="role">${options(Object.entries(LABELS.role), u?.role || 'engineer')}</select></label>
       <label>${u ? 'New password (leave empty to keep)' : 'Password'}<input name="password" type="password" minlength="8" ${u ? '' : 'required'} autocomplete="new-password"></label>
+      <label class="check full"><input type="checkbox" name="notify" ${!u || u.notify ? 'checked' : ''}> Email notifications</label>
       ${u ? `<label class="check full"><input type="checkbox" name="active" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
       ${u?.sso_linked ? '<label class="check full"><input type="checkbox" name="unlink_sso"> Unlink Microsoft account (the next Microsoft sign-in will match by email again)</label>' : ''}
       <div class="error full"></div>
@@ -1425,9 +1533,11 @@ async function renderSettings() {
     if (u) {
       data.active = !!data.active;
       data.unlink_sso = !!data.unlink_sso;
+      data.notify = !!data.notify;
       if (!data.password) delete data.password;
       await api(`/users/${u.id}`, { method: 'PATCH', body: data });
     } else {
+      data.notify = !!data.notify;
       await api('/users', { method: 'POST', body: data });
     }
     closeModal();

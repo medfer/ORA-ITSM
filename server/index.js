@@ -4,10 +4,12 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
 const {
-  db, DB_FILE, UPLOAD_DIR, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS,
+  db, DB_FILE, UPLOAD_DIR, getSettings, setSetting, getSecret, setSecret, hashPassword, verifyPassword, DEFAULT_SETTINGS,
 } = require('./db');
 const sla = require('./sla');
 const sso = require('./sso');
+const mailer = require('./mailer');
+const notify = require('./notify');
 
 const PORT = Number(process.env.PORT) || 8080;
 const SESSION_DAYS = 7;
@@ -184,7 +186,17 @@ app.post('/api/logout', wrap((req, res) => {
   res.json({ ok: true });
 }));
 
-app.get('/api/me', (req, res) => res.json(req.user));
+app.get('/api/me', (req, res) => {
+  const row = db.prepare('SELECT notify FROM users WHERE id = ?').get(req.user.id);
+  res.json({ ...req.user, notify: row ? row.notify : 1 });
+});
+
+app.patch('/api/me', wrap((req, res) => {
+  if (req.body?.notify !== undefined) {
+    db.prepare('UPDATE users SET notify = ? WHERE id = ?').run(req.body.notify ? 1 : 0, req.user.id);
+  }
+  res.json({ ok: true });
+}));
 
 app.post('/api/me/password', wrap((req, res) => {
   const { current, next: pwd } = req.body || {};
@@ -201,6 +213,7 @@ app.post('/api/me/password', wrap((req, res) => {
 app.get('/api/meta', wrap((req, res) => {
   const settings = getSettings();
   settings.sso = sso.normalizeConfig(settings.sso);
+  if (req.user.role !== 'admin') delete settings.mail;
   res.json({
     settings,
     statuses: STATUSES,
@@ -280,6 +293,7 @@ app.post('/api/tickets', wrap((req, res) => {
     createdAt, now, dues.response_due, dues.resolution_due);
   const id = Number(info.lastInsertRowid);
   logChange(id, req.user.id, 'created', null, priority, now);
+  notify.ticketCreated(id, req.user);
   res.status(201).json({ id, number: ticketNumber(id, settings) });
 }));
 
@@ -374,6 +388,7 @@ app.patch('/api/tickets/:id', staff, wrap((req, res) => {
       .run(...cols.map((k) => upd[k]), t.id);
     const tracked = ['title', 'type', 'priority', 'status', 'category', 'assignee_id', 'ms_case'];
     for (const k of keys) if (tracked.includes(k)) logChange(t.id, req.user.id, k, t[k], upd[k], now);
+    notify.ticketUpdated(t.id, t, keys, req.user);
   }
   res.json({ ok: true, changed: keys });
 }));
@@ -395,6 +410,7 @@ app.post('/api/tickets/:id/comments', wrap((req, res) => {
   const now = Date.now();
   db.prepare('INSERT INTO comments (ticket_id, user_id, body, internal, created_at) VALUES (?, ?, ?, ?, ?)')
     .run(t.id, req.user.id, body, internal, now);
+  notify.commentAdded(t.id, { body, internal }, req.user);
   // A public reply from the support team counts as the SLA first response
   if (isStaff && !internal && !t.first_response_at) {
     db.prepare('UPDATE tickets SET first_response_at = ?, updated_at = ? WHERE id = ?').run(now, now, t.id);
@@ -451,6 +467,14 @@ app.delete('/api/attachments/:id', staff, wrap((req, res) => {
 
 // ---------- time tracking ----------
 
+function checkAllowance(workDate) {
+  const month = workDate.slice(0, 7);
+  const r = monthRange(month, getSettings());
+  const used = db.prepare(`SELECT COALESCE(SUM(minutes),0) AS m FROM time_entries
+    WHERE billable = 1 AND work_date >= ? AND work_date < ?`).get(r.dayFrom, r.dayTo).m;
+  notify.checkAllowance(month, used);
+}
+
 function validateEntry(b) {
   const minutes = Math.round(Number(b.minutes));
   if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) throw new HttpError(400, 'Invalid duration');
@@ -478,6 +502,7 @@ app.post('/api/time', staff, wrap((req, res) => {
   db.prepare(`INSERT INTO time_entries (ticket_id, user_id, work_date, minutes, description, billable, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)`).run(ticketId, userId, workDate, minutes, String(b.description || ''), b.billable === false ? 0 : 1, now);
   if (ticketId) db.prepare('UPDATE tickets SET updated_at = ? WHERE id = ?').run(now, ticketId);
+  checkAllowance(workDate);
   res.status(201).json({ ok: true });
 }));
 
@@ -489,6 +514,7 @@ app.patch('/api/time/:id', staff, wrap((req, res) => {
   const { minutes, workDate } = validateEntry(b);
   db.prepare('UPDATE time_entries SET work_date = ?, minutes = ?, description = ?, billable = ? WHERE id = ?')
     .run(workDate, minutes, String(b.description || ''), b.billable === false || b.billable === 0 ? 0 : 1, e.id);
+  checkAllowance(workDate);
   res.json({ ok: true });
 }));
 
@@ -731,6 +757,51 @@ app.put('/api/settings', admin, wrap((req, res) => {
   res.json(getSettings());
 }));
 
+app.get('/api/settings/mail', admin, wrap((req, res) => {
+  const cfg = mailer.mailConfig();
+  res.json({ ...cfg, secret_set: !!getSecret('mail_client_secret'), default_app_url: `${req.protocol}://${req.get('host')}` });
+}));
+
+app.put('/api/settings/mail', admin, wrap((req, res) => {
+  const b = req.body || {};
+  const cfg = mailer.mailConfig({
+    enabled: !!b.enabled,
+    sender: b.sender,
+    tenant_id: b.tenant_id,
+    client_id: b.client_id,
+    staff_email: b.staff_email,
+    app_url: b.app_url || `${req.protocol}://${req.get('host')}`,
+    events: b.events || {},
+  });
+  if (b.client_secret) setSecret('mail_client_secret', String(b.client_secret).trim());
+  if (cfg.enabled) {
+    const problem = mailer.configProblem(cfg, getSecret('mail_client_secret'));
+    if (problem) throw new HttpError(400, problem);
+  }
+  setSetting('mail', cfg);
+  res.json({ ...cfg, secret_set: !!getSecret('mail_client_secret') });
+}));
+
+app.post('/api/settings/mail/test', admin, wrap(async (req, res) => {
+  const to = String(req.body?.to || req.user.email).trim();
+  const settings = getSettings();
+  const cfg = mailer.mailConfig();
+  const html = notify.layout(settings, cfg, {
+    heading: 'Test email from ORA ITSM',
+    intro: `If you can read this, email notifications from <b>${cfg.sender}</b> are working.`,
+  });
+  try {
+    await mailer.sendNow({ to, subject: 'ORA ITSM test email', html, cfg });
+  } catch (e) {
+    throw new HttpError(400, e.message);
+  }
+  res.json({ ok: true, to });
+}));
+
+app.get('/api/admin/email-log', admin, wrap((req, res) => {
+  res.json(db.prepare('SELECT * FROM email_log ORDER BY id DESC LIMIT 50').all());
+}));
+
 app.put('/api/settings/sso', admin, wrap((req, res) => {
   const b = req.body || {};
   const cfg = sso.normalizeConfig({
@@ -776,7 +847,7 @@ app.post('/api/sla/recalculate', admin, wrap((req, res) => res.json({ updated: r
 
 app.get('/api/users', admin, wrap((req, res) => {
   res.json(db.prepare(`SELECT id, name, email, role, active, created_at, last_login_at,
-    entra_oid IS NOT NULL AS sso_linked FROM users ORDER BY name`).all());
+    entra_oid IS NOT NULL AS sso_linked, notify FROM users ORDER BY name`).all());
 }));
 
 app.post('/api/users', admin, wrap((req, res) => {
@@ -785,8 +856,8 @@ app.post('/api/users', admin, wrap((req, res) => {
   if (!['admin', 'engineer', 'client'].includes(b.role)) throw new HttpError(400, 'Invalid role');
   if (String(b.password || '').length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
   try {
-    db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(String(b.name), String(b.email).trim(), hashPassword(b.password), b.role, Date.now());
+    db.prepare('INSERT INTO users (name, email, password_hash, role, notify, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(String(b.name), String(b.email).trim(), hashPassword(b.password), b.role, b.notify === false ? 0 : 1, Date.now());
   } catch (e) {
     if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'This email already exists');
     throw e;
@@ -815,6 +886,7 @@ app.patch('/api/users/:id', admin, wrap((req, res) => {
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(b.password), u.id);
   }
   if (b.unlink_sso) db.prepare('UPDATE users SET entra_oid = NULL WHERE id = ?').run(u.id);
+  if (b.notify !== undefined) db.prepare('UPDATE users SET notify = ? WHERE id = ?').run(b.notify ? 1 : 0, u.id);
   if (!active || b.password) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
   res.json({ ok: true });
 }));
@@ -866,8 +938,20 @@ app.use((err, req, res, _next) => {
   res.status(status).json({ error: status >= 500 ? 'Internal server error' : message });
 });
 
+function runSlaCheck() {
+  const settings = getSettings();
+  const pols = policies();
+  const now = Date.now();
+  const open = db.prepare(`SELECT t.*, a.name AS assignee_name FROM tickets t LEFT JOIN users a ON a.id = t.assignee_id
+    WHERE t.status IN (${OPEN_STATUSES.map(() => '?').join(',')})`).all(...OPEN_STATUSES)
+    .map((t) => decorate(t, pols, settings, now));
+  notify.checkSla(open);
+}
+
 if (require.main === module) {
+  setInterval(() => { try { runSlaCheck(); } catch (e) { console.error(e); } }, 5 * 60000).unref();
   app.listen(PORT, () => console.log(`[ora-itsm] Server running at http://localhost:${PORT}`));
 }
 
 module.exports = app;
+module.exports.runSlaCheck = runSlaCheck;

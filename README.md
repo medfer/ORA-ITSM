@@ -35,6 +35,7 @@ You can open the file with [DB Browser for SQLite](https://sqlitebrowser.org/) t
 | Dashboard | Allowance gauge, SLA alerts, my open tickets, tickets by status, auto-refresh every minute |
 | Administration | Contract, business hours, SLA policies, users · **one-click database backup download** |
 | Roles | **Administrator** (everything), **Engineer** (tickets, time, reports), **Client** (opens and follows tickets, never sees internal notes or per-engineer hours) |
+| Email notifications | Office 365 mailbox via Microsoft Graph: ticket received, status changes, replies, assignment, SLA alerts, allowance alerts — per-event and per-user switches, delivery log |
 | Sign-in | **Microsoft Entra ID single sign-on** (SPA, PKCE; single or multi-tenant with a role per tenant) and/or email + password |
 | Interface | Modern layout, light / dark / system theme, global search (`/`), quick filters, responsive mobile menu |
 | Security | Hashed passwords (scrypt), server-side ID token verification, login brute-force protection, session tokens, security headers |
@@ -118,6 +119,47 @@ Update later with: `powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\
 To move existing data from another PC: stop the task (`Stop-ScheduledTask ORA-ITSM`), copy your `data` folder into `C:\ora-itsm\data`, then `Start-ScheduledTask ORA-ITSM`.
 
 **Before giving access to the client:** change the admin password, create the user accounts, and schedule backups.
+
+## Email notifications (Office 365)
+
+ORA ITSM sends notifications from an Office 365 mailbox (e.g. `Med@carthagecloudsolutions.com`) through
+**Microsoft Graph** (SMTP basic authentication is retired by Microsoft). Emails are sent in the background,
+retried 3 times, and listed in **Settings → Email notifications → Recent emails**.
+
+| Event | Recipient |
+|---|---|
+| Ticket received | client (account email / requester email) |
+| Status change (in progress, pending client, pending Microsoft, resolved with resolution text, closed) | client |
+| Public reply from the team (internal notes are never emailed) | client |
+| New ticket | team address, or all engineers and admins |
+| Ticket assigned | the engineer |
+| Client reply | the assigned engineer (or the team) |
+| SLA at risk / breached (checked every 5 minutes, sent once) | assignee + admins |
+| Monthly allowance threshold / 100% used (once per month) | admins, and clients if enabled |
+
+Each event can be turned on or off; each user can turn their own emails off (user menu → *Email notifications*),
+and an admin can do it per user in **Settings → Users**.
+
+### Setup (once)
+
+1. **entra.microsoft.com → App registrations → New registration**: name `ORA ITSM Mail`, single tenant, no redirect URI.
+2. **API permissions → Add a permission → Microsoft Graph → Application permissions → `Mail.Send`**, then **Grant admin consent**.
+3. **Certificates & secrets → New client secret** (e.g. 24 months) — copy the **Value** right away.
+4. In ORA ITSM, **Settings → Email notifications**: sender mailbox, tenant ID, client ID, client secret → **Save**, then **Send test**.
+
+The client secret is stored server-side only and is never sent to browsers. Put a reminder to renew it before it expires.
+
+**Recommended — limit the app to the sender mailbox only.** `Mail.Send` granted in Entra allows sending as any mailbox of the tenant.
+To scope it to one mailbox, use Exchange Online *RBAC for Applications* instead of the Entra permission
+(remove `Mail.Send` from *API permissions* after this):
+
+```powershell
+Connect-ExchangeOnline
+# Object ID of the Enterprise application (Entra -> Enterprise applications -> ORA ITSM Mail -> Object ID)
+New-ServicePrincipal -AppId <client-id> -ObjectId <enterprise-app-object-id> -DisplayName "ORA ITSM Mail"
+New-ManagementScope -Name "ORA ITSM sender" -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'Med@carthagecloudsolutions.com'"
+New-ManagementRoleAssignment -App <client-id> -Role "Application Mail.Send" -CustomResourceScope "ORA ITSM sender"
+```
 
 ## Sign in with Microsoft (Entra ID SSO)
 
@@ -230,6 +272,8 @@ server/index.js           REST API (auth, tickets, attachments, time, reports, s
 server/db.js              SQLite schema, default settings, initial admin account
 server/sla.js             due-date calculation (business hours, pause)
 server/sso.js             Microsoft Entra ID token verification
+server/mailer.js          Office 365 email delivery (Microsoft Graph), queue and log
+server/notify.js          notification rules and email templates
 server/reset-password.js  command-line password reset
 public/                   web interface (index.html, app.js, style.css)
 test/                     node:test tests
