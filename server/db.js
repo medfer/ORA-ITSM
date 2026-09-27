@@ -160,6 +160,9 @@ function seed() {
     db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
       .run('Administrateur', email, hashPassword(password), 'admin', Date.now());
     console.log(`[ora-itsm] Compte admin créé : ${email} (changez le mot de passe après la première connexion)`);
+  } else {
+    const admins = db.prepare("SELECT email FROM users WHERE role = 'admin' AND active = 1").all().map((u) => u.email);
+    console.log(`[ora-itsm] Comptes admin : ${admins.join(', ') || 'aucun'} (ADMIN_EMAIL/ADMIN_PASSWORD ignorés : la base existe déjà)`);
   }
 }
 

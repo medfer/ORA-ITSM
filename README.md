@@ -33,6 +33,18 @@ Ouvrir `http://<ip-du-serveur>:8080` et se connecter avec le compte admin défin
 Puis dans **Paramètres** : vérifier le forfait, les heures ouvrées, les délais SLA, et créer les comptes
 ingénieurs et le(s) compte(s) client ORA.
 
+### Mot de passe oublié / « mot de passe incorrect »
+
+`ADMIN_EMAIL` et `ADMIN_PASSWORD` ne servent qu'à la **création** de la base : les modifier ensuite n'a aucun effet.
+Pour réinitialiser un mot de passe :
+
+```bash
+docker compose exec ora-itsm node server/reset-password.js --list                         # voir les comptes
+docker compose exec ora-itsm node server/reset-password.js admin@ora-itsm.local 'NouveauMdp!2026'
+```
+
+(sans Docker : `node server/reset-password.js <email> <mot_de_passe>`).
+
 ### HTTPS (recommandé)
 
 Placer un reverse proxy devant le conteneur, par exemple Caddy (certificat Let's Encrypt automatique) :
