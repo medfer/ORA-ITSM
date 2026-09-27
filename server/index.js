@@ -7,6 +7,7 @@ const {
   db, DB_FILE, UPLOAD_DIR, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS,
 } = require('./db');
 const sla = require('./sla');
+const sso = require('./sso');
 
 const PORT = Number(process.env.PORT) || 8080;
 const SESSION_DAYS = 7;
@@ -106,6 +107,16 @@ const requireRole = (...roles) => (req, _res, next) =>
 const staff = requireRole('admin', 'engineer');
 const admin = requireRole('admin');
 
+function openSession(res, user) {
+  const now = Date.now();
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
+  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
+    .run(token, user.id, now + SESSION_DAYS * 86400000);
+  db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(now, user.id);
+  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+}
+
 app.post('/api/login', wrap((req, res) => {
   const { email, password } = req.body || {};
   const key = loginKey(req, email);
@@ -121,11 +132,45 @@ app.post('/api/login', wrap((req, res) => {
     throw new HttpError(401, 'Incorrect email or password');
   }
   failedLogins.delete(key);
-  const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
-  db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
-    .run(token, user.id, now + SESSION_DAYS * 86400000);
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+  // When password sign-in is turned off, only administrators keep it (break-glass access)
+  if (!sso.normalizeConfig(getSettings().sso).password_login && user.role !== 'admin') {
+    throw new HttpError(403, 'Please use "Sign in with Microsoft"');
+  }
+  openSession(res, user);
+}));
+
+// Public: what the login page needs to start the Microsoft sign-in
+app.get('/api/auth/config', wrap((req, res) => res.json(sso.publicConfig(getSettings().sso))));
+
+app.post('/api/auth/entra', wrap(async (req, res) => {
+  const { id_token: idToken, nonce } = req.body || {};
+  let identity;
+  try {
+    identity = await sso.verifyIdToken(idToken, getSettings().sso, nonce);
+  } catch (e) {
+    throw new HttpError(401, e.message);
+  }
+  let user = db.prepare('SELECT * FROM users WHERE entra_oid = ?').get(identity.oid);
+  if (!user && identity.email) {
+    user = db.prepare('SELECT * FROM users WHERE email = ?').get(identity.email);
+    if (user && user.entra_oid && user.entra_oid !== identity.oid) {
+      throw new HttpError(403, 'This email is already linked to another Microsoft account');
+    }
+    if (user) db.prepare('UPDATE users SET entra_oid = ? WHERE id = ?').run(identity.oid, user.id);
+  }
+  if (!user) {
+    if (!identity.autoProvision) {
+      throw new HttpError(403, `No ORA ITSM account exists for ${identity.email || 'this Microsoft account'}. Ask an administrator to add you.`);
+    }
+    if (!identity.email) throw new HttpError(403, 'Your Microsoft account has no email address');
+    const info = db.prepare(`INSERT INTO users (name, email, password_hash, role, entra_oid, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(identity.name, identity.email,
+      hashPassword(crypto.randomBytes(24).toString('hex')), identity.role, identity.oid, Date.now());
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(info.lastInsertRowid));
+    console.log(`[ora-itsm] Account created from Microsoft sign-in: ${identity.email} (${identity.role})`);
+  }
+  if (!user.active) throw new HttpError(403, 'Your account is disabled');
+  openSession(res, user);
 }));
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
@@ -153,6 +198,7 @@ app.post('/api/me/password', wrap((req, res) => {
 
 app.get('/api/meta', wrap((req, res) => {
   const settings = getSettings();
+  settings.sso = sso.normalizeConfig(settings.sso);
   res.json({
     settings,
     statuses: STATUSES,
@@ -683,6 +729,22 @@ app.put('/api/settings', admin, wrap((req, res) => {
   res.json(getSettings());
 }));
 
+app.put('/api/settings/sso', admin, wrap((req, res) => {
+  const b = req.body || {};
+  const cfg = sso.normalizeConfig({
+    enabled: !!b.enabled,
+    client_id: b.client_id,
+    tenant: b.tenant,
+    allowed_tenants: b.allowed_tenants,
+    auto_provision: !!b.auto_provision,
+    default_role: b.default_role,
+    password_login: b.password_login !== false,
+  });
+  if (b.enabled && !cfg.enabled) throw new HttpError(400, 'Application (client) ID must be a GUID');
+  setSetting('sso', cfg);
+  res.json(cfg);
+}));
+
 app.put('/api/sla/:priority', admin, wrap((req, res) => {
   const b = req.body || {};
   const p = db.prepare('SELECT * FROM sla_policies WHERE priority = ?').get(req.params.priority);
@@ -711,7 +773,8 @@ function recalcOpenTickets() {
 app.post('/api/sla/recalculate', admin, wrap((req, res) => res.json({ updated: recalcOpenTickets() })));
 
 app.get('/api/users', admin, wrap((req, res) => {
-  res.json(db.prepare('SELECT id, name, email, role, active, created_at FROM users ORDER BY name').all());
+  res.json(db.prepare(`SELECT id, name, email, role, active, created_at, last_login_at,
+    entra_oid IS NOT NULL AS sso_linked FROM users ORDER BY name`).all());
 }));
 
 app.post('/api/users', admin, wrap((req, res) => {
@@ -749,6 +812,7 @@ app.patch('/api/users/:id', admin, wrap((req, res) => {
     if (String(b.password).length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(b.password), u.id);
   }
+  if (b.unlink_sso) db.prepare('UPDATE users SET entra_oid = NULL WHERE id = ?').run(u.id);
   if (!active || b.password) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
   res.json({ ok: true });
 }));

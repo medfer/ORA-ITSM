@@ -35,7 +35,9 @@ You can open the file with [DB Browser for SQLite](https://sqlitebrowser.org/) t
 | Dashboard | Allowance gauge, SLA alerts, my open tickets, tickets by status, auto-refresh every minute |
 | Administration | Contract, business hours, SLA policies, users · **one-click database backup download** |
 | Roles | **Administrator** (everything), **Engineer** (tickets, time, reports), **Client** (opens and follows tickets, never sees internal notes or per-engineer hours) |
-| Security | Hashed passwords (scrypt), login brute-force protection, session tokens, security headers |
+| Sign-in | **Microsoft Entra ID single sign-on** (SPA, PKCE; single or multi-tenant with a role per tenant) and/or email + password |
+| Interface | Modern layout, light / dark / system theme, global search (`/`), quick filters, responsive mobile menu |
+| Security | Hashed passwords (scrypt), server-side ID token verification, login brute-force protection, session tokens, security headers |
 
 ## Run on Windows (no Docker)
 
@@ -79,6 +81,47 @@ itsm.your-domain.com {
 ```
 
 and restrict the port in `docker-compose.yml` to `"127.0.0.1:8080:8080"`.
+
+## Sign in with Microsoft (Entra ID SSO)
+
+ORA ITSM supports single sign-on with **Microsoft Entra ID** as a **single-page application**
+(authorization code flow with PKCE — no client secret is stored anywhere). The browser signs the user in with
+Microsoft, then the server verifies the ID token signature (Microsoft public keys), audience, issuer, tenant,
+expiry and nonce before opening an ORA ITSM session.
+
+**Requirement:** Microsoft only accepts `https://` redirect URIs (except `http://localhost`), so publish the app behind HTTPS first (see HTTPS above).
+
+### 1. Register the application in Entra ID
+
+1. [Entra admin center](https://entra.microsoft.com) → **Identity → Applications → App registrations → New registration**
+2. Name: `ORA ITSM`
+3. Supported account types:
+   - *Accounts in this organizational directory only* — only one company signs in, or
+   - *Accounts in any organizational directory (multitenant)* — **Black Star engineers and ORA users from their own tenants**
+4. Redirect URI: platform **Single-page application (SPA)**, value = the app address with a trailing slash, e.g. `https://itsm.your-domain.com/`
+   (the exact value is shown with a copy button in **Settings → Microsoft Entra ID sign-in**)
+5. Register, then copy the **Application (client) ID** and **Directory (tenant) ID** from the Overview page.
+
+No client secret, certificate or API permission is needed (`openid profile email` are granted by default).
+Optional: **Enterprise applications → ORA ITSM → Properties → Assignment required = Yes**, then assign the users/groups allowed in.
+
+For a multitenant app, an administrator of the ORA tenant must consent once (the first ORA user sign-in shows the consent prompt, or use
+`https://login.microsoftonline.com/<ORA-tenant-id>/adminconsent?client_id=<client-id>`).
+
+### 2. Configure ORA ITSM
+
+**Settings → Microsoft Entra ID sign-in (SSO)**:
+
+| Field | Value |
+|---|---|
+| Application (client) ID | from the app registration |
+| Directory (tenant) ID | your tenant GUID (single tenant), or `organizations` (multitenant) |
+| Allowed tenants and their role | one per line, e.g. `<blackstar-tenant-id>=engineer` and `<ora-tenant-id>=client`. Users from other tenants are refused. |
+| Create accounts automatically | new users get the tenant's role (or the default role) on first sign-in |
+| Also allow password sign-in | untick to force Microsoft sign-in; administrators keep password access (break-glass) |
+
+Existing accounts are matched by email on the first Microsoft sign-in, then linked to the Entra object ID.
+An administrator can unlink a Microsoft account from **Settings → Users → Edit**.
 
 ## Forgotten password / "incorrect password"
 
@@ -137,6 +180,7 @@ npm test        # SLA + API tests
 server/index.js           REST API (auth, tickets, attachments, time, reports, settings, backup)
 server/db.js              SQLite schema, default settings, initial admin account
 server/sla.js             due-date calculation (business hours, pause)
+server/sso.js             Microsoft Entra ID token verification
 server/reset-password.js  command-line password reset
 public/                   web interface (index.html, app.js, style.css)
 test/                     node:test tests

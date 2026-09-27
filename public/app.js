@@ -90,6 +90,7 @@ function fmtBytes(n) {
 function fmtRelative(ms) {
   const diff = Number(ms) - Date.now();
   const abs = Math.abs(diff) / 60000;
+  if (abs < 1) return 'just now';
   let s;
   if (abs < 60) s = `${Math.round(abs)} min`;
   else if (abs < 60 * 48) s = `${Math.round(abs / 6) / 10} h`;
@@ -140,6 +141,20 @@ const badge = (text, cls = '') => `<span class="badge ${cls}">${esc(text)}</span
 const statusBadge = (s) => badge(LABELS.status[s] || s, LABELS.statusClass[s]);
 const prioBadge = (p) => `<span class="prio ${esc(p)}">${esc(p)}</span>`;
 const slaBadge = (s) => (s ? badge(LABELS.sla[s] || s, LABELS.slaClass[s]) : '');
+const ICONS = {
+  clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>',
+  ticket: '<svg viewBox="0 0 24 24"><path d="M3 8a2 2 0 0 0 0 4v5a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5a2 2 0 0 0 0-4V7a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2z"/></svg>',
+  check: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg>',
+  alert: '<svg viewBox="0 0 24 24"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>',
+  inbox: '<svg viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z"/></svg>',
+  plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
+  download: '<svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/></svg>',
+  print: '<svg viewBox="0 0 24 24"><path d="M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="m6 4 14 8-14 8z"/></svg>',
+};
+const emptyState = (text, ic = 'inbox') => `<div class="empty">${ICONS[ic] || ''}${esc(text)}</div>`;
+const avatar = (name) => `<span class="avatar" style="width:34px;height:34px;font-size:12px">${esc(initials(name))}</span>`;
+
 const ticketNo = (id) => `${state.meta?.settings?.ticket_prefix || 'TCK'}-${String(id).padStart(5, '0')}`;
 
 function csvDownload(filename, header, rows) {
@@ -253,7 +268,23 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal
 
 // ================= session =================
 
+function initials(name) {
+  return String(name || '?').split(/[\s@.]+/).filter(Boolean).slice(0, 2).map((p) => p[0].toUpperCase()).join('');
+}
+
 async function boot() {
+  initChrome();
+  try {
+    state.authConfig = await fetch('/api/auth/config').then((r) => r.json());
+  } catch {
+    state.authConfig = { enabled: false, password_login: true };
+  }
+  try {
+    if (await completeMicrosoftLogin()) return;
+  } catch (ex) {
+    showLogin(ex.message);
+    return;
+  }
   state.token = store.get('ora_token');
   if (!state.token) return showLogin();
   try {
@@ -265,20 +296,49 @@ async function boot() {
   }
 }
 
-function showLogin() {
+function showLogin(error = '') {
+  const cfg = state.authConfig || { enabled: false, password_login: true };
   $('#app').classList.add('hidden');
   $('#login').classList.remove('hidden');
+  $('#btn-microsoft').classList.toggle('hidden', !cfg.enabled);
+  $('#login-divider').classList.toggle('hidden', !(cfg.enabled && cfg.password_login));
+  $('#login-form').classList.toggle('hidden', !cfg.password_login);
+  $('#show-password-login').classList.toggle('hidden', cfg.password_login);
+  $('#login-error').textContent = error;
+}
+
+async function signedIn(r) {
+  state.token = r.token;
+  store.set('ora_token', r.token);
+  state.user = r.user;
+  state.meta = await api('/meta');
+  showApp();
 }
 
 function showApp() {
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
-  $('#me-name').textContent = state.user.name;
-  $('#me-role').textContent = LABELS.role[state.user.role];
+  const u = state.user;
+  $('#me-name').textContent = u.name;
+  $('#me-role').textContent = LABELS.role[u.role];
+  $('#me-avatar').textContent = initials(u.name);
+  $('#menu-name').textContent = u.name;
+  $('#menu-email').textContent = u.email;
+  $('#sidebar-foot').textContent = `${state.meta.settings.company_name} → ${state.meta.settings.client_name}`;
   $$('[data-staff]').forEach((a) => a.classList.toggle('hidden', !isStaff()));
   $$('[data-admin]').forEach((a) => a.classList.toggle('hidden', !isAdmin()));
   updateTimerPill();
+  refreshNavCount();
   route();
+}
+
+async function refreshNavCount() {
+  try {
+    const rows = await api('/tickets?status=open');
+    const el = $('#nav-open');
+    el.textContent = rows.length;
+    el.classList.toggle('hidden', !rows.length);
+  } catch { /* ignore */ }
 }
 
 function logout(callApi = true) {
@@ -286,6 +346,7 @@ function logout(callApi = true) {
   store.remove('ora_token');
   state.token = null;
   state.user = null;
+  $('#user-menu').classList.add('hidden');
   showLogin();
 }
 
@@ -295,20 +356,26 @@ $('#login-form').addEventListener('submit', async (e) => {
   $('#login-error').textContent = '';
   try {
     const r = await api('/login', { method: 'POST', body: f });
-    state.token = r.token;
-    store.set('ora_token', r.token);
-    state.user = r.user;
-    state.meta = await api('/meta');
     e.target.reset();
-    showApp();
+    await signedIn(r);
   } catch (ex) {
     $('#login-error').textContent = ex.message;
   }
 });
 
+$('#show-password-login').addEventListener('click', (e) => {
+  $('#login-form').classList.remove('hidden');
+  e.target.classList.add('hidden');
+});
+
+$('#btn-microsoft').addEventListener('click', () => {
+  startMicrosoftLogin().catch((ex) => { $('#login-error').textContent = ex.message; });
+});
+
 $('#btn-logout').addEventListener('click', () => logout());
 
 $('#btn-password').addEventListener('click', () => {
+  $('#user-menu').classList.add('hidden');
   openModal(`
     <h2>Change my password</h2>
     <form class="form-grid">
@@ -322,6 +389,118 @@ $('#btn-password').addEventListener('click', () => {
     toast('Password changed');
   });
 });
+
+// ================= Microsoft Entra ID sign-in =================
+// Single-page-application flow: authorization code + PKCE, no client secret.
+// The ID token is then verified by the server, which opens an ORA ITSM session.
+
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const randomString = (n = 32) => b64url(crypto.getRandomValues(new Uint8Array(n)));
+const redirectUri = () => `${location.origin}/`;
+
+async function startMicrosoftLogin() {
+  const cfg = state.authConfig;
+  if (!window.isSecureContext || !crypto.subtle) {
+    throw new Error('Microsoft sign-in needs HTTPS (or http://localhost). Open the application through its https:// address.');
+  }
+  const verifier = randomString(48);
+  const pkce = { verifier, state: randomString(16), nonce: randomString(16), hash: location.hash };
+  try { sessionStorage.setItem('ora_pkce', JSON.stringify(pkce)); } catch { throw new Error('Browser storage is blocked; enable it to sign in'); }
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const params = new URLSearchParams({
+    client_id: cfg.client_id,
+    response_type: 'code',
+    redirect_uri: redirectUri(),
+    response_mode: 'query',
+    scope: 'openid profile email',
+    state: pkce.state,
+    nonce: pkce.nonce,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    prompt: 'select_account',
+  });
+  location.assign(`${cfg.authority}/oauth2/v2.0/authorize?${params}`);
+}
+
+// Handles the redirect back from Microsoft. Returns true when a sign-in was completed.
+async function completeMicrosoftLogin() {
+  const q = new URLSearchParams(location.search);
+  if (!q.has('code') && !q.has('error')) return false;
+  let saved = null;
+  try { saved = JSON.parse(sessionStorage.getItem('ora_pkce')); sessionStorage.removeItem('ora_pkce'); } catch { /* ignore */ }
+  history.replaceState(null, '', `/${saved?.hash || ''}`);
+  if (q.has('error')) throw new Error((q.get('error_description') || q.get('error')).split(/\r?\n/)[0]);
+  if (!saved || saved.state !== q.get('state')) throw new Error('The sign-in request expired, please try again');
+  const cfg = state.authConfig;
+  if (!cfg.enabled) throw new Error('Microsoft sign-in is not enabled');
+  const res = await fetch(`${cfg.authority}/oauth2/v2.0/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: cfg.client_id,
+      grant_type: 'authorization_code',
+      code: q.get('code'),
+      redirect_uri: redirectUri(),
+      code_verifier: saved.verifier,
+      scope: 'openid profile email',
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.id_token) {
+    throw new Error((data.error_description || 'Microsoft sign-in failed').split(/\r?\n/)[0]);
+  }
+  const r = await api('/auth/entra', { method: 'POST', body: { id_token: data.id_token, nonce: saved.nonce } });
+  await signedIn(r);
+  return true;
+}
+
+// ================= page chrome: theme, menus, search =================
+
+const THEME_ICONS = {
+  light: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>',
+  dark: '<svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>',
+  system: '<svg viewBox="0 0 24 24"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+};
+
+function applyTheme(mode) {
+  if (mode === 'light' || mode === 'dark') document.documentElement.dataset.theme = mode;
+  else delete document.documentElement.dataset.theme;
+  $('#theme-btn').innerHTML = THEME_ICONS[mode] || THEME_ICONS.system;
+  $('#theme-btn').title = `Theme: ${mode || 'system'}`;
+}
+
+function initChrome() {
+  let theme = null;
+  try { theme = localStorage.getItem('ora_theme'); } catch { /* ignore */ }
+  applyTheme(theme || 'system');
+  $('#theme-btn').addEventListener('click', () => {
+    const order = ['system', 'light', 'dark'];
+    let cur = 'system';
+    try { cur = localStorage.getItem('ora_theme') || 'system'; } catch { /* ignore */ }
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    try { localStorage.setItem('ora_theme', next); } catch { /* ignore */ }
+    applyTheme(next);
+    toast(`Theme: ${next}`);
+  });
+  $('#user-btn').addEventListener('click', (e) => { e.stopPropagation(); $('#user-menu').classList.toggle('hidden'); });
+  document.addEventListener('click', (e) => { if (!e.target.closest('.user-menu')) $('#user-menu').classList.add('hidden'); });
+  $('#menu-btn').addEventListener('click', () => $('#app').classList.toggle('nav-open'));
+  $('#scrim').addEventListener('click', () => $('#app').classList.remove('nav-open'));
+  const search = $('#global-search');
+  search.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const q = search.value.trim();
+    const m = q.match(/^(?:[a-z]+-)?0*(\d+)$/i);
+    if (m) { location.hash = `#/tickets/${Number(m[1])}`; search.value = ''; return; }
+    ticketFilters.q = q;
+    ticketFilters.status = '';
+    if (location.hash === '#/tickets') route(); else location.hash = '#/tickets';
+    search.value = '';
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === '/' && !e.target.closest('input, textarea, select') && !modalOpen()) { e.preventDefault(); search.focus(); }
+  });
+}
 
 // ================= work timer =================
 // One running timer per browser, kept in localStorage so it survives reloads.
@@ -375,6 +554,7 @@ const routes = {
 
 async function route() {
   if (!state.user) return;
+  $('#app').classList.remove('nav-open');
   pageCleanup.forEach((fn) => fn());
   pageCleanup = [];
   const [, name = 'dashboard', id] = location.hash.split('/');
@@ -453,25 +633,25 @@ async function renderDashboard() {
   }
 
   const ticketRows = (list, empty = 'No tickets') => list.length ? `<div class="table-wrap"><table><tbody>${list.map((t) => `
-    <tr class="clickable" data-id="${t.id}"><td class="nowrap">${prioBadge(t.priority)} <b>${esc(t.number)}</b></td>
-    <td>${esc(t.title)}</td><td>${statusBadge(t.status)}</td>
+    <tr class="clickable prio-${esc(t.priority)}" data-id="${t.id}"><td class="nowrap">${prioBadge(t.priority)} <b>${esc(t.number)}</b></td>
+    <td class="ticket-title">${esc(t.title)}<div class="muted small">${esc(t.assignee_name || 'Unassigned')} · updated ${fmtRelative(t.updated_at)}</div></td><td>${statusBadge(t.status)}</td>
     <td class="nowrap">${slaBadge(t.sla_resolution === 'breached' || t.sla_resolution === 'at_risk' ? t.sla_resolution : t.sla_response)}</td></tr>`).join('')}</tbody></table></div>`
-    : `<p class="muted">${esc(empty)}</p>`;
+    : emptyState(empty, empty.startsWith('Nothing') ? 'check' : 'inbox');
 
   view().innerHTML = `
-    <div class="page-head"><div><h1>Dashboard</h1><div class="muted">${esc(s.contract_name)} — ${esc(monthLabel(d.month))}</div></div>
-      <div class="actions"><button class="btn primary" id="new-ticket">+ New ticket</button></div></div>
+    <div class="page-head"><div><h1>Good ${new Date().getHours() < 12 ? 'morning' : new Date().getHours() < 18 ? 'afternoon' : 'evening'}, ${esc(state.user.name.split(' ')[0])}</h1><div class="muted">${esc(s.contract_name)} — ${esc(monthLabel(d.month))}</div></div>
+      <div class="actions"><button class="btn primary" id="new-ticket">${ICONS.plus} New ticket</button></div></div>
     ${alert}
     <div class="grid cols-4">
-      <div class="card stat"><div class="label">Hours used</div>
+      <div class="card stat"><div class="stat-icon ${pct >= 100 ? 'bad' : pct >= threshold ? 'warn' : ''}">${ICONS.clock}</div><div class="label">Hours used</div>
         <div class="value">${fmtHours(d.used_minutes)} <span class="muted small">/ ${fmtHours(d.contract_minutes)}</span></div>
         ${meter(d.used_minutes, d.contract_minutes, threshold)}
         <div class="sub">${pct}% · ${fmtHours(Math.max(0, d.contract_minutes - d.used_minutes))} left · projected ${fmtHours(d.projected_minutes)}</div></div>
-      <div class="card stat"><div class="label">Open tickets</div><div class="value">${d.open_count}</div>
+      <div class="card stat"><div class="stat-icon">${ICONS.ticket}</div><div class="label">Open tickets</div><div class="value">${d.open_count}</div>
         <div class="sub">${Object.entries(d.by_priority).map(([p, n]) => `${p}: ${n}`).join(' · ')} · unassigned: ${d.unassigned}</div></div>
-      <div class="card stat"><div class="label">This month</div><div class="value">${d.created} <span class="muted small">created</span></div>
+      <div class="card stat"><div class="stat-icon ok">${ICONS.check}</div><div class="label">This month</div><div class="value">${d.created} <span class="muted small">created</span></div>
         <div class="sub">${d.resolved} resolved · SLA resolution ${pctTxt(d.sla_resolution_pct)} · response ${pctTxt(d.sla_response_pct)}</div></div>
-      <div class="card stat"><div class="label">SLA alerts</div>
+      <div class="card stat"><div class="stat-icon ${d.breached.length ? 'bad' : d.at_risk.length ? 'warn' : 'ok'}">${ICONS.alert}</div><div class="label">SLA alerts</div>
         <div class="value" style="color:${d.breached.length ? 'var(--bad)' : 'inherit'}">${d.breached.length} <span class="muted small">breached</span></div>
         <div class="sub">${d.at_risk.length} at risk</div></div>
     </div>
@@ -508,14 +688,22 @@ const prioOptions = () => state.meta.policies.map((p) => [p.priority, `${p.prior
 const staffOptions = () => state.meta.users.filter((u) => u.role !== 'client').map((u) => [u.id, u.name]);
 const categoryOptions = () => (state.meta.settings.categories || []).map((c) => [c, c]);
 
+const QUICK_VIEWS = [
+  { label: 'Open', f: { status: 'open', assignee: '' } },
+  { label: 'My tickets', f: { status: 'open', assignee: 'me' }, staff: true },
+  { label: 'Unassigned', f: { status: 'open', assignee: 'none' }, staff: true },
+  { label: 'Pending client', f: { status: 'pending_client', assignee: '' } },
+  { label: 'Resolved', f: { status: 'resolved', assignee: '' } },
+  { label: 'All', f: { status: '', assignee: '' } },
+];
+
 const TICKET_COLUMNS = [
   { key: 'id', label: 'No.', val: (t) => t.id },
   { key: 'title', label: 'Title', val: (t) => t.title.toLowerCase() },
-  { key: 'type', label: 'Type', val: (t) => t.type },
   { key: 'status', label: 'Status', val: (t) => state.meta.statuses.indexOf(t.status) },
   { key: 'assignee', label: 'Assignee', val: (t) => (t.assignee_name || '~').toLowerCase() },
-  { key: 'sla_response', label: 'Response SLA', val: (t) => t.sla_response },
-  { key: 'sla_resolution', label: 'Resolution SLA', val: (t) => t.sla_resolution },
+  { key: 'sla_response', label: 'Response', val: (t) => t.sla_response },
+  { key: 'sla_resolution', label: 'Resolution', val: (t) => t.sla_resolution },
   { key: 'due', label: 'Due', val: (t) => (t.resolved_at ? Infinity : t.effective_resolution_due) },
   { key: 'time', label: 'Time', val: (t) => t.time_minutes, num: true },
   { key: 'created', label: 'Created', val: (t) => t.created_at },
@@ -526,9 +714,10 @@ async function renderTickets() {
   let rows = [];
   view().innerHTML = `
     <div class="page-head"><h1>Tickets</h1><div class="actions">
-      <button class="btn" id="export-csv">Export CSV</button>
-      <button class="btn primary" id="new-ticket">+ New ticket</button></div></div>
+      <button class="btn" id="export-csv">${ICONS.download} Export CSV</button>
+      <button class="btn primary" id="new-ticket">${ICONS.plus} New ticket</button></div></div>
     <div class="card">
+      <div class="chips" id="chips">${QUICK_VIEWS.filter((v) => isStaff() || !v.staff).map((v, i) => `<button class="chip" data-view="${i}">${v.label}</button>`).join('')}</div>
       <div class="filters">
         <input type="search" id="f-q" placeholder="Search (title, number, MS case, requester)…" value="${esc(f.q)}">
         <select id="f-status">${options([['open', 'Open'], ['', 'All'], ...statusOptions()], f.status)}</select>
@@ -551,18 +740,17 @@ async function renderTickets() {
     }
     $('#ticket-list').innerHTML = sorted.length ? `<div class="table-wrap"><table>
       <thead><tr>${TICKET_COLUMNS.map((c) => `<th class="sortable${c.num ? ' num' : ''}${ticketSort.key === c.key ? (ticketSort.dir > 0 ? ' sorted-asc' : ' sorted-desc') : ''}" data-sort="${c.key}">${c.label}</th>`).join('')}</tr></thead>
-      <tbody>${sorted.map((t) => `<tr class="clickable" data-id="${t.id}">
+      <tbody>${sorted.map((t) => `<tr class="clickable prio-${esc(t.priority)}" data-id="${t.id}">
         <td class="nowrap">${prioBadge(t.priority)} <b>${esc(t.number)}</b></td>
-        <td>${esc(t.title)}${t.attachment_count ? ` <span class="muted small" title="Attachments">📎${t.attachment_count}</span>` : ''}${t.category ? `<div class="muted small">${esc(t.category)}</div>` : ''}</td>
-        <td class="nowrap">${esc(LABELS.type[t.type])}</td>
+        <td class="ticket-title">${esc(t.title)}${t.attachment_count ? ` <span class="muted small" title="Attachments">📎${t.attachment_count}</span>` : ''}<div class="muted small">${esc(LABELS.type[t.type])}${t.category ? ` · ${esc(t.category)}` : ''}</div></td>
         <td>${statusBadge(t.status)}</td>
         <td class="nowrap">${esc(t.assignee_name || '—')}</td>
         <td>${slaBadge(t.sla_response)}</td>
         <td>${slaBadge(t.sla_resolution)}</td>
         <td class="nowrap small">${t.resolved_at ? '—' : `${fmtDate(t.effective_resolution_due)}<div class="muted">${fmtRelative(t.effective_resolution_due)}</div>`}</td>
         <td class="num nowrap">${fmtDuration(t.time_minutes)}</td>
-        <td class="nowrap small">${fmtDate(t.created_at)}</td></tr>`).join('')}</tbody></table></div>
-      <p class="muted small">${sorted.length} ticket(s) · click a column header to sort</p>` : '<p class="muted">No tickets match the filters.</p>';
+        <td class="nowrap small">${fmtDate(t.created_at, false)}</td></tr>`).join('')}</tbody></table></div>
+      <p class="muted small">${sorted.length} ticket(s) · click a column header to sort</p>` : emptyState('No tickets match these filters');
     $$('#ticket-list tr[data-id]').forEach((tr) => tr.addEventListener('click', () => { location.hash = `#/tickets/${tr.dataset.id}`; }));
     $$('#ticket-list th[data-sort]').forEach((th) => th.addEventListener('click', () => {
       if (ticketSort.key === th.dataset.sort) ticketSort.dir *= -1;
@@ -571,11 +759,23 @@ async function renderTickets() {
     }));
   };
 
+  const syncChips = () => $$('#chips .chip').forEach((c) => {
+    const v = QUICK_VIEWS[c.dataset.view].f;
+    c.classList.toggle('active', v.status === f.status && v.assignee === f.assignee && !f.priority && !f.type);
+  });
   const reload = async () => {
     const qs = new URLSearchParams(Object.entries(f).filter(([, v]) => v !== '')).toString();
     rows = await api(`/tickets?${qs}`);
+    syncChips();
     draw();
   };
+  $$('#chips .chip').forEach((c) => c.addEventListener('click', () => {
+    Object.assign(f, QUICK_VIEWS[c.dataset.view].f, { priority: '', type: '' });
+    for (const [id, key] of [['#f-status', 'status'], ['#f-assignee', 'assignee'], ['#f-priority', 'priority'], ['#f-type', 'type']]) {
+      if ($(id)) $(id).value = f[key];
+    }
+    reload();
+  }));
   const bind = (id, key) => {
     const el = $(id);
     if (!el) return;
@@ -657,8 +857,8 @@ async function renderTicket(id) {
         <h1>${prioBadge(t.priority)} ${esc(t.number)} — ${esc(t.title)}</h1>
         <div class="muted small">Opened ${fmtDate(t.created_at)} by ${esc(t.created_by_name || '—')} · ${esc(LABELS.type[t.type])}${t.category ? ` · ${esc(t.category)}` : ''}</div></div>
       <div class="actions">${statusBadge(t.status)}
-        ${staff ? `<button class="btn${timerHere ? ' running' : ''}" id="timer-btn" data-ticket="${t.id}">${timerHere ? `■ Stop ${fmtClock(Date.now() - timer.start)}` : '▶ Start timer'}</button>
-          <button class="btn" id="edit-ticket">Edit</button><button class="btn primary" id="add-time">+ Log time</button>` : ''}
+        ${staff ? `<button class="btn${timerHere ? ' running' : ''}" id="timer-btn" data-ticket="${t.id}">${timerHere ? `■ Stop ${fmtClock(Date.now() - timer.start)}` : `${ICONS.play} Start timer`}</button>
+          <button class="btn" id="edit-ticket">Edit</button><button class="btn primary" id="add-time">${ICONS.plus} Log time</button>` : ''}
         ${isAdmin() ? '<button class="btn danger" id="del-ticket">Delete</button>' : ''}</div>
     </div>
     <div class="ticket-layout">
@@ -673,8 +873,8 @@ async function renderTicket(id) {
           </div>
           <div data-panel="comments">
             <div class="timeline">${comments.map((c) => `
-              <div class="comment ${c.internal ? 'internal' : ''}"><div class="head"><span><b>${esc(c.user_name || '—')}</b>${c.internal ? ' · internal note' : ''}</span><span>${fmtDate(c.created_at)}</span></div>
-              <div class="pre">${esc(c.body)}</div></div>`).join('') || '<p class="muted">No messages yet.</p>'}</div>
+              <div class="comment ${c.internal ? 'internal' : ''}">${avatar(c.user_name)}<div class="bubble"><div class="head"><span><b>${esc(c.user_name || '—')}</b>${c.user_role === 'client' ? ' · client' : ''}${c.internal ? ' · internal note' : ''}</span><span title="${fmtDate(c.created_at)}">${fmtRelative(c.created_at)}</span></div>
+              <div class="pre">${esc(c.body)}</div></div></div>`).join('') || emptyState('No messages yet — start the conversation below')}</div>
             <form id="comment-form" style="margin-top:14px" class="grid">
               <textarea name="body" placeholder="Add a reply or a note…" required></textarea>
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
@@ -690,7 +890,7 @@ async function renderTicket(id) {
                   <div class="muted small">${fmtBytes(a.size)} · ${esc(a.user_name || '—')} · ${fmtDate(a.created_at)}</div></div>
                 <button class="btn sm" data-download="${a.id}">Download</button>
                 ${canDelete(a) ? `<button class="btn sm danger" data-del-file="${a.id}">✕</button>` : ''}
-              </div>`).join('') || '<p class="muted">No attachments.</p>'}</div>
+              </div>`).join('') || emptyState('No attachments yet')}</div>
             <div class="dropzone" id="dropzone">Drop files here, click to choose, or paste a screenshot (Ctrl+V) — max ${state.meta.max_upload_mb} MB
               <input type="file" id="file-input" multiple hidden></div>
           </div>
@@ -711,8 +911,12 @@ async function renderTicket(id) {
       <div class="grid">
         <div class="card"><h2>SLA — ${esc(t.priority)} ${esc(policy?.name || '')}</h2>
           <div class="sla-box">
-            <div class="sla-item"><div><b>First response</b><div class="muted small">Due ${fmtDate(t.response_due)}${t.first_response_at ? `<br>Responded ${fmtDate(t.first_response_at)}` : `<br>${fmtRelative(t.response_due)}`}</div></div>${slaBadge(t.sla_response)}</div>
-            <div class="sla-item"><div><b>Resolution</b><div class="muted small">Due ${fmtDate(t.effective_resolution_due)}${t.resolved_at ? `<br>Resolved ${fmtDate(t.resolved_at)}` : `<br>${fmtRelative(t.effective_resolution_due)}`}</div></div>${slaBadge(t.sla_resolution)}</div>
+            <div class="sla-item"><div class="row"><b>First response</b>${slaBadge(t.sla_response)}</div>
+              ${slaBar(t.created_at, t.response_due, t.first_response_at, t.sla_response)}
+              <div class="muted small">Due ${fmtDate(t.response_due)} · ${t.first_response_at ? `responded ${fmtDate(t.first_response_at)}` : fmtRelative(t.response_due)}</div></div>
+            <div class="sla-item"><div class="row"><b>Resolution</b>${slaBadge(t.sla_resolution)}</div>
+              ${slaBar(t.created_at, t.effective_resolution_due, t.resolved_at, t.sla_resolution)}
+              <div class="muted small">Due ${fmtDate(t.effective_resolution_due)} · ${t.resolved_at ? `resolved ${fmtDate(t.resolved_at)}` : fmtRelative(t.effective_resolution_due)}</div></div>
             <div class="muted small">${policy ? `Targets: response ${fmtDuration(policy.response_min)}, resolution ${fmtDuration(policy.resolution_min)} (${policy.business_hours ? 'business hours' : '24/7'})` : ''}
             ${t.paused_minutes ? `<br>Total paused time: ${fmtDuration(t.paused_minutes)}` : ''}</div>
           </div></div>
@@ -835,6 +1039,13 @@ async function renderTicket(id) {
   });
 }
 
+// Share of the SLA window consumed, as a small progress bar
+function slaBar(start, due, end, st) {
+  const pct = Math.max(2, Math.min(100, ((end || Date.now()) - start) / Math.max(1, due - start) * 100));
+  const cls = { met: 'ok', breached: 'bad', at_risk: 'warn' }[st] || '';
+  return `<div class="sla-progress ${cls}"><span style="width:${pct}%"></span></div>`;
+}
+
 function editTicketModal(t, preset = {}) {
   const v = { ...t, ...preset };
   openModal(`
@@ -916,7 +1127,7 @@ async function renderTime() {
     <div class="page-head"><div><h1>Time tracking</h1><div class="muted">${esc(monthLabel(timeMonth))}</div></div>
       <div class="actions"><button class="btn" id="m-prev">‹</button><input type="month" id="m-pick" value="${timeMonth}" style="width:auto"><button class="btn" id="m-next">›</button>
       <button class="btn" id="export-csv">Export CSV</button>
-      <button class="btn primary" id="add-time">+ Log time</button></div></div>
+      <button class="btn primary" id="add-time">${ICONS.plus} Log time</button></div></div>
     <div class="grid cols-3">
       <div class="card stat"><div class="label">Billable / allowance</div><div class="value">${fmtHours(billable)} <span class="muted small">/ ${fmtHours(contract)}</span></div>
         ${meter(billable, contract, Number(s.alert_threshold_pct) || 80)}<div class="sub">${billable > contract ? `Overage: ${fmtHours(billable - contract)}` : `${fmtHours(contract - billable)} remaining`}</div></div>
@@ -930,7 +1141,7 @@ async function renderTime() {
         <td class="nowrap">${esc(e.user_name)}</td><td class="pre">${esc(e.description)}</td>
         <td class="num nowrap">${fmtDuration(e.minutes)}</td><td>${e.billable ? 'Yes' : badge('No')}</td>
         <td>${isAdmin() || e.user_id === state.user.id ? `<button class="link small" data-edit="${e.id}">Edit</button>` : ''}</td></tr>`).join('')}
-      </tbody></table></div>` : '<p class="muted">No time logged this month.</p>'}
+      </tbody></table></div>` : emptyState('No time logged this month', 'clock')}
     </div>`;
   const go = (m) => { timeMonth = m; renderTime(); };
   $('#m-prev').addEventListener('click', () => go(shiftMonth(timeMonth, -1)));
@@ -954,8 +1165,8 @@ async function renderReports() {
   view().innerHTML = `
     <div class="page-head no-print"><h1>Monthly report</h1>
       <div class="actions"><button class="btn" id="m-prev">‹</button><input type="month" id="m-pick" value="${reportMonth}" style="width:auto"><button class="btn" id="m-next">›</button>
-        <button class="btn" id="csv-time">CSV time</button><button class="btn" id="csv-tickets">CSV tickets</button>
-        <button class="btn primary" id="print">Print / PDF</button></div></div>
+        <button class="btn" id="csv-time">${ICONS.download} CSV time</button><button class="btn" id="csv-tickets">${ICONS.download} CSV tickets</button>
+        <button class="btn primary" id="print">${ICONS.print} Print / PDF</button></div></div>
 
     <div class="report-head">
       <div><div class="muted small">${esc(r.settings.company_name)} → ${esc(r.settings.client_name)}</div>
@@ -1027,6 +1238,7 @@ async function renderSettings() {
   const bh = s.business_hours || {};
   const [users, sys] = await Promise.all([api('/users'), api('/admin/system')]);
   const offH = (Number(bh.offset) || 0) / 60;
+  const ssoCfg = s.sso;
 
   view().innerHTML = `
     <div class="page-head"><h1>Settings</h1></div>
@@ -1066,11 +1278,47 @@ async function renderSettings() {
       </div>
 
       <div class="card span-2"><div class="page-head" style="margin-bottom:10px"><h2 style="margin:0">Users</h2><button class="btn primary" id="add-user">+ User</button></div>
-        <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr></thead><tbody>
-        ${users.map((u) => `<tr><td>${esc(u.name)}</td><td>${esc(u.email)}</td><td>${esc(LABELS.role[u.role])}</td>
+        <div class="table-wrap"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Sign-in</th><th>Last sign-in</th><th>Status</th><th></th></tr></thead><tbody>
+        ${users.map((u) => `<tr><td><div style="display:flex;align-items:center;gap:10px">${avatar(u.name)}<b>${esc(u.name)}</b></div></td><td>${esc(u.email)}</td><td>${esc(LABELS.role[u.role])}</td>
+          <td>${u.sso_linked ? badge('Microsoft', 'accent') : badge('Password', 'plain')}</td>
+          <td class="small muted nowrap">${u.last_login_at ? fmtRelative(u.last_login_at) : 'never'}</td>
           <td>${u.active ? badge('Active', 'ok') : badge('Disabled')}</td><td><button class="link" data-user="${u.id}">Edit</button></td></tr>`).join('')}
         </tbody></table></div>
         <p class="muted small">Roles: <b>Administrator</b> (everything), <b>Engineer</b> (tickets, time, reports), <b>Client</b> (opens and follows their requests, sees reports without internal notes).</p>
+      </div>
+
+      <div class="card span-2" id="sso-card">
+        <div class="card-head"><h2><span class="status-dot ${ssoCfg.enabled ? 'on' : ''}"></span>Microsoft Entra ID sign-in (SSO)</h2>
+          ${ssoCfg.enabled ? badge('Enabled', 'ok') : badge('Disabled')}</div>
+        <div class="grid cols-2">
+          <form id="f-sso" class="form-grid">
+            <label class="check full"><input type="checkbox" name="enabled" ${ssoCfg.enabled ? 'checked' : ''}> Enable “Sign in with Microsoft”</label>
+            <label class="full">Application (client) ID<input name="client_id" value="${esc(ssoCfg.client_id)}" placeholder="00000000-0000-0000-0000-000000000000" spellcheck="false"></label>
+            <label class="full">Directory (tenant) ID <span class="hint">— your tenant GUID, or <code>organizations</code> if users come from several tenants (e.g. Black Star and ORA)</span>
+              <input name="tenant" value="${esc(ssoCfg.tenant)}" spellcheck="false"></label>
+            <label class="full">Allowed tenants and their role <span class="hint">— one per line: <code>tenant-guid=engineer</code> or <code>tenant-guid=client</code>. Leave empty to accept only the tenant above.</span>
+              <textarea name="allowed_tenants" rows="3" spellcheck="false" placeholder="11111111-1111-1111-1111-111111111111=engineer&#10;22222222-2222-2222-2222-222222222222=client">${esc(ssoCfg.allowed_tenants.map((t) => `${t.id}${t.role ? `=${t.role}` : ''}`).join('\n'))}</textarea></label>
+            <label class="check full"><input type="checkbox" name="auto_provision" ${ssoCfg.auto_provision ? 'checked' : ''}> Create accounts automatically on first Microsoft sign-in</label>
+            <label>Default role for new accounts<select name="default_role">${options([['client', 'Client'], ['engineer', 'Engineer']], ssoCfg.default_role)}</select></label>
+            <label class="check" style="align-self:end"><input type="checkbox" name="password_login" ${ssoCfg.password_login ? 'checked' : ''}> Also allow password sign-in</label>
+            <p class="hint full" style="margin:0">When password sign-in is off, administrators can still use their password (break-glass access).</p>
+            <div class="foot full"><button class="btn primary" type="submit">Save SSO settings</button></div>
+          </form>
+          <div>
+            <h3>Setup in the Microsoft Entra admin center</h3>
+            <ol class="steps">
+              <li><b>Entra ID → App registrations → New registration</b>. Name: <i>ORA ITSM</i>. Supported account types: <i>this directory only</i> (single tenant) or <i>any Entra ID tenant</i> (multitenant, for Black Star + ORA users).</li>
+              <li>Redirect URI: platform <b>Single-page application (SPA)</b>, value:<br>
+                <code id="redirect-uri">${esc(location.origin)}/</code> <button type="button" class="link small" id="copy-redirect">Copy</button></li>
+              <li>Copy the <b>Application (client) ID</b> and <b>Directory (tenant) ID</b> from the Overview page into this form.</li>
+              <li>No client secret and no API permission are needed (only <code>openid profile email</code>, granted by default).</li>
+              <li>Optional: <b>Enterprise applications → ORA ITSM → Properties → Assignment required = Yes</b>, then assign the users or groups allowed to sign in.</li>
+              <li>Existing users are matched by email the first time they sign in with Microsoft.</li>
+            </ol>
+            ${location.protocol !== 'https:' && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)
+              ? '<div class="alert warn" style="margin-top:14px">Microsoft only accepts HTTPS redirect URIs (except localhost). Publish ORA ITSM behind HTTPS before enabling SSO.</div>' : ''}
+          </div>
+        </div>
       </div>
 
       <div class="card span-2"><div class="page-head" style="margin-bottom:10px"><h2 style="margin:0">Database &amp; backup</h2><button class="btn primary" id="backup">Download backup</button></div>
@@ -1129,6 +1377,33 @@ async function renderSettings() {
     } catch (ex) { toast(ex.message, true); }
   });
 
+  $('#copy-redirect').addEventListener('click', () => {
+    navigator.clipboard?.writeText($('#redirect-uri').textContent).then(() => toast('Redirect URI copied'), () => toast('Copy failed', true));
+  });
+
+  $('#f-sso').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const allowed = String(f.get('allowed_tenants') || '').split('\n').map((l) => l.trim()).filter(Boolean).map((l) => {
+      const [id, role = ''] = l.split('=').map((x) => x.trim());
+      return { id, role };
+    });
+    const bad = allowed.find((t) => !/^[0-9a-f-]{36}$/i.test(t.id) || !['', 'engineer', 'client', 'admin'].includes(t.role));
+    if (bad) return toast(`Invalid allowed tenant line: ${bad.id}${bad.role ? `=${bad.role}` : ''}`, true);
+    try {
+      await api('/settings/sso', {
+        method: 'PUT',
+        body: {
+          enabled: !!f.get('enabled'), client_id: f.get('client_id'), tenant: f.get('tenant'), allowed_tenants: allowed,
+          auto_provision: !!f.get('auto_provision'), default_role: f.get('default_role'), password_login: !!f.get('password_login'),
+        },
+      });
+      state.authConfig = await fetch('/api/auth/config').then((r) => r.json());
+      toast('SSO settings saved');
+      renderSettings();
+    } catch (ex) { toast(ex.message, true); }
+  });
+
   $('#backup').addEventListener('click', () => download('/admin/backup', `ora-itsm-backup-${todayLocal()}.db`));
 
   const userModal = (u) => openModal(`
@@ -1139,11 +1414,13 @@ async function renderSettings() {
       <label>Role<select name="role">${options(Object.entries(LABELS.role), u?.role || 'engineer')}</select></label>
       <label>${u ? 'New password (leave empty to keep)' : 'Password'}<input name="password" type="password" minlength="8" ${u ? '' : 'required'} autocomplete="new-password"></label>
       ${u ? `<label class="check full"><input type="checkbox" name="active" ${u.active ? 'checked' : ''}> Account active</label>` : ''}
+      ${u?.sso_linked ? '<label class="check full"><input type="checkbox" name="unlink_sso"> Unlink Microsoft account (the next Microsoft sign-in will match by email again)</label>' : ''}
       <div class="error full"></div>
       <div class="foot full"><button type="button" class="btn" data-close>Cancel</button><button class="btn primary" type="submit">Save</button></div>
     </form>`, async (data) => {
     if (u) {
       data.active = !!data.active;
+      data.unlink_sso = !!data.unlink_sso;
       if (!data.password) delete data.password;
       await api(`/users/${u.id}`, { method: 'PATCH', body: data });
     } else {

@@ -113,6 +113,12 @@ CREATE TABLE IF NOT EXISTS attachments (
 CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON attachments(ticket_id);
 `);
 
+// Lightweight migrations for databases created by earlier versions
+const userCols = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+if (!userCols.includes('entra_oid')) db.exec('ALTER TABLE users ADD COLUMN entra_oid TEXT');
+if (!userCols.includes('last_login_at')) db.exec('ALTER TABLE users ADD COLUMN last_login_at INTEGER');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_entra_oid ON users(entra_oid) WHERE entra_oid IS NOT NULL');
+
 const DEFAULT_SETTINGS = {
   company_name: 'Black Star Iraq',
   client_name: 'ORA',
