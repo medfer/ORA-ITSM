@@ -1,6 +1,6 @@
-// Calcul des échéances SLA, en heures calendaires (24x7) ou en heures ouvrées.
-// Les heures ouvrées sont exprimées dans le fuseau du client via un décalage UTC
-// fixe en minutes (Irak : UTC+3, sans heure d'été).
+// SLA due-date computation, in calendar time (24x7) or business hours.
+// Business hours are expressed in the client's time zone as a fixed UTC offset
+// in minutes (Iraq: UTC+3, no daylight saving).
 
 const MIN = 60 * 1000;
 const DAY = 24 * 60 * MIN;
@@ -20,7 +20,7 @@ function normalize(bh) {
   };
 }
 
-// Début de la journée locale (en ms UTC) contenant l'instant t.
+// Start of the local day (UTC ms) containing instant t.
 function localDayStart(t, offset) {
   const local = t + offset * MIN;
   return local - (((local % DAY) + DAY) % DAY) - offset * MIN;
@@ -75,7 +75,7 @@ function minutesBetween(aMs, bMs, policy, bh) {
   return policy.business_hours ? businessMinutesBetween(aMs, bMs, bh) : Math.max(0, (bMs - aMs) / MIN);
 }
 
-// Échéances d'un ticket à partir de sa politique SLA et du temps passé en pause.
+// Ticket due dates from its SLA policy and the time spent paused.
 function computeDues(ticket, policy, bh) {
   return {
     response_due: addMinutes(ticket.created_at, policy.response_min, policy, bh),
@@ -83,7 +83,7 @@ function computeDues(ticket, policy, bh) {
   };
 }
 
-// État SLA calculé à la lecture : 'met' | 'breached' | 'running' | 'at_risk' | 'paused'.
+// SLA state computed on read: 'met' | 'breached' | 'running' | 'at_risk' | 'paused'.
 function slaState(ticket, policy, bh, now = Date.now()) {
   const res = {};
   const responseAt = ticket.first_response_at;
@@ -102,7 +102,7 @@ function slaState(ticket, policy, bh, now = Date.now()) {
   return res;
 }
 
-// "À risque" lorsque plus de 75 % du délai est consommé.
+// "At risk" once more than 75% of the allowed time is used.
 function riskOf(start, due, now) {
   const span = due - start;
   return span > 0 && (now - start) / span >= 0.75 ? 'at_risk' : 'running';

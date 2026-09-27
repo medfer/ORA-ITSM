@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -11,11 +11,11 @@
   <div id="login" class="login hidden">
     <form id="login-form" class="login-card">
       <div class="brand big"><span class="logo">▤</span> ORA ITSM</div>
-      <p class="muted">Support Microsoft — gestion des incidents, SLA et temps</p>
+      <p class="muted">Microsoft support — incidents, SLA and time tracking</p>
       <label>Email<input name="email" type="email" autocomplete="username" required></label>
-      <label>Mot de passe<input name="password" type="password" autocomplete="current-password" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <div id="login-error" class="error"></div>
-      <button class="btn primary" type="submit">Se connecter</button>
+      <button class="btn primary" type="submit">Sign in</button>
     </form>
   </div>
 
@@ -23,18 +23,19 @@
     <aside class="sidebar">
       <div class="brand"><span class="logo">▤</span> ORA ITSM</div>
       <nav id="nav">
-        <a href="#/dashboard" data-route="dashboard">Tableau de bord</a>
+        <a href="#/dashboard" data-route="dashboard">Dashboard</a>
         <a href="#/tickets" data-route="tickets">Tickets</a>
-        <a href="#/time" data-route="time" data-staff>Temps passé</a>
-        <a href="#/reports" data-route="reports">Rapports</a>
-        <a href="#/settings" data-route="settings" data-admin>Paramètres</a>
+        <a href="#/time" data-route="time" data-staff>Time tracking</a>
+        <a href="#/reports" data-route="reports">Reports</a>
+        <a href="#/settings" data-route="settings" data-admin>Settings</a>
       </nav>
+      <a id="timer-pill" class="timer-pill hidden" href="#"></a>
       <div class="me">
         <div id="me-name"></div>
         <div class="muted small" id="me-role"></div>
         <div class="me-actions">
-          <button class="link" id="btn-password">Mot de passe</button> ·
-          <button class="link" id="btn-logout">Déconnexion</button>
+          <button class="link" id="btn-password">Password</button> ·
+          <button class="link" id="btn-logout">Sign out</button>
         </div>
       </div>
     </aside>

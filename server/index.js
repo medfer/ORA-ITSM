@@ -1,11 +1,16 @@
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const express = require('express');
-const { db, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS } = require('./db');
+const {
+  db, DB_FILE, UPLOAD_DIR, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS,
+} = require('./db');
 const sla = require('./sla');
 
 const PORT = Number(process.env.PORT) || 8080;
 const SESSION_DAYS = 7;
+const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 20;
 
 const STATUSES = ['new', 'in_progress', 'pending_client', 'pending_microsoft', 'resolved', 'closed', 'cancelled'];
 const OPEN_STATUSES = ['new', 'in_progress', 'pending_client', 'pending_microsoft'];
@@ -13,10 +18,17 @@ const PAUSE_STATUSES = ['pending_client'];
 const TYPES = ['incident', 'request', 'change', 'problem'];
 
 const app = express();
+app.disable('x-powered-by');
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'same-origin');
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// ---------- utilitaires ----------
+// ---------- helpers ----------
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -36,9 +48,9 @@ function ticketNumber(id, settings) {
   return `${settings.ticket_prefix || 'TCK'}-${String(id).padStart(5, '0')}`;
 }
 
-// Bornes UTC d'un mois local 'YYYY-MM' selon le décalage horaire du client.
+// UTC bounds of a local month 'YYYY-MM', using the client's UTC offset.
 function monthRange(month, settings) {
-  if (!/^\d{4}-\d{2}$/.test(month || '')) throw new HttpError(400, 'Mois invalide (format AAAA-MM)');
+  if (!/^\d{4}-\d{2}$/.test(month || '')) throw new HttpError(400, 'Invalid month (expected YYYY-MM)');
   const [y, m] = month.split('-').map(Number);
   const offset = (settings.business_hours?.offset || 0) * 60000;
   return {
@@ -66,35 +78,53 @@ function decorate(t, pols, settings, now = Date.now()) {
   };
 }
 
-// ---------- authentification ----------
+// ---------- authentication ----------
+
+// Simple brute-force protection: 10 failed attempts per IP+email in 15 minutes.
+const failedLogins = new Map();
+const LOGIN_WINDOW = 15 * 60000;
+const LOGIN_MAX = 10;
+
+function loginKey(req, email) {
+  return `${req.ip}|${String(email || '').toLowerCase()}`;
+}
 
 function auth(req, _res, next) {
   const header = req.get('authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return next(new HttpError(401, 'Non authentifié'));
+  if (!token) return next(new HttpError(401, 'Not authenticated'));
   const row = db.prepare(`SELECT u.id, u.name, u.email, u.role, u.active, s.expires_at
                           FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`).get(token);
-  if (!row || !row.active || row.expires_at < Date.now()) return next(new HttpError(401, 'Session expirée'));
+  if (!row || !row.active || row.expires_at < Date.now()) return next(new HttpError(401, 'Session expired'));
   req.user = { id: row.id, name: row.name, email: row.email, role: row.role };
   req.token = token;
   next();
 }
 
 const requireRole = (...roles) => (req, _res, next) =>
-  roles.includes(req.user.role) ? next() : next(new HttpError(403, 'Accès refusé'));
+  roles.includes(req.user.role) ? next() : next(new HttpError(403, 'Access denied'));
 const staff = requireRole('admin', 'engineer');
 const admin = requireRole('admin');
 
 app.post('/api/login', wrap((req, res) => {
   const { email, password } = req.body || {};
+  const key = loginKey(req, email);
+  const now = Date.now();
+  const attempts = (failedLogins.get(key) || []).filter((t) => now - t < LOGIN_WINDOW);
+  if (attempts.length >= LOGIN_MAX) {
+    throw new HttpError(429, 'Too many failed attempts. Please wait 15 minutes and try again.');
+  }
   const user = db.prepare('SELECT * FROM users WHERE email = ?').get(String(email || '').trim());
   if (!user || !user.active || !verifyPassword(String(password || ''), user.password_hash)) {
-    throw new HttpError(401, 'Email ou mot de passe incorrect');
+    attempts.push(now);
+    failedLogins.set(key, attempts);
+    throw new HttpError(401, 'Incorrect email or password');
   }
+  failedLogins.delete(key);
   const token = crypto.randomBytes(32).toString('hex');
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
   db.prepare('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
-    .run(token, user.id, Date.now() + SESSION_DAYS * 86400000);
+    .run(token, user.id, now + SESSION_DAYS * 86400000);
   res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
 }));
 
@@ -112,14 +142,14 @@ app.get('/api/me', (req, res) => res.json(req.user));
 app.post('/api/me/password', wrap((req, res) => {
   const { current, next: pwd } = req.body || {};
   const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
-  if (!verifyPassword(String(current || ''), user.password_hash)) throw new HttpError(400, 'Mot de passe actuel incorrect');
-  if (String(pwd || '').length < 8) throw new HttpError(400, 'Le nouveau mot de passe doit contenir au moins 8 caractères');
+  if (!verifyPassword(String(current || ''), user.password_hash)) throw new HttpError(400, 'Current password is incorrect');
+  if (String(pwd || '').length < 8) throw new HttpError(400, 'New password must be at least 8 characters');
   db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(pwd), req.user.id);
   db.prepare('DELETE FROM sessions WHERE user_id = ? AND token <> ?').run(req.user.id, req.token);
   res.json({ ok: true });
 }));
 
-// ---------- référentiels ----------
+// ---------- reference data ----------
 
 app.get('/api/meta', wrap((req, res) => {
   const settings = getSettings();
@@ -129,7 +159,8 @@ app.get('/api/meta', wrap((req, res) => {
     open_statuses: OPEN_STATUSES,
     types: TYPES,
     policies: Object.values(policies()),
-    users: db.prepare("SELECT id, name, role FROM users WHERE active = 1 ORDER BY name").all(),
+    users: db.prepare('SELECT id, name, role FROM users WHERE active = 1 ORDER BY name').all(),
+    max_upload_mb: MAX_UPLOAD_MB,
   });
 }));
 
@@ -164,11 +195,12 @@ app.get('/api/tickets', wrap((req, res) => {
   }
   const rows = db.prepare(`
     SELECT t.*, a.name AS assignee_name,
-      (SELECT COALESCE(SUM(minutes), 0) FROM time_entries te WHERE te.ticket_id = t.id) AS time_minutes
+      (SELECT COALESCE(SUM(minutes), 0) FROM time_entries te WHERE te.ticket_id = t.id) AS time_minutes,
+      (SELECT COUNT(*) FROM attachments at WHERE at.ticket_id = t.id) AS attachment_count
     FROM tickets t LEFT JOIN users a ON a.id = t.assignee_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY CASE WHEN t.status IN ('resolved','closed','cancelled') THEN 1 ELSE 0 END, t.priority, t.created_at DESC
-    LIMIT 1000`).all(...args);
+    LIMIT 2000`).all(...args);
   const pols = policies();
   const now = Date.now();
   res.json(rows.map((t) => decorate(t, pols, settings, now)));
@@ -179,13 +211,17 @@ app.post('/api/tickets', wrap((req, res) => {
   const settings = getSettings();
   const pols = policies();
   const title = String(b.title || '').trim();
-  if (!title) throw new HttpError(400, 'Le titre est obligatoire');
+  if (!title) throw new HttpError(400, 'Title is required');
   const priority = pols[b.priority] ? b.priority : 'P3';
   const type = TYPES.includes(b.type) ? b.type : 'incident';
   const now = Date.now();
-  const createdAt = req.user.role !== 'client' && b.created_at ? Number(new Date(b.created_at)) || now : now;
-  const dues = sla.computeDues({ created_at: createdAt, paused_minutes: 0 }, pols[priority], settings.business_hours);
   const isClient = req.user.role === 'client';
+  let createdAt = now;
+  if (!isClient && b.created_at) {
+    createdAt = Number(new Date(b.created_at)) || now;
+    if (createdAt > now) throw new HttpError(400, 'Opening date cannot be in the future');
+  }
+  const dues = sla.computeDues({ created_at: createdAt, paused_minutes: 0 }, pols[priority], settings.business_hours);
   const info = db.prepare(`
     INSERT INTO tickets (title, description, type, priority, status, category, requester_name, requester_email,
       assignee_id, created_by, ms_case, created_at, updated_at, response_due, resolution_due)
@@ -203,7 +239,7 @@ function loadTicket(id) {
   const t = db.prepare(`SELECT t.*, a.name AS assignee_name, c.name AS created_by_name
     FROM tickets t LEFT JOIN users a ON a.id = t.assignee_id LEFT JOIN users c ON c.id = t.created_by
     WHERE t.id = ?`).get(Number(id));
-  if (!t) throw new HttpError(404, 'Ticket introuvable');
+  if (!t) throw new HttpError(404, 'Ticket not found');
   return t;
 }
 
@@ -218,9 +254,14 @@ app.get('/api/tickets/:id', wrap((req, res) => {
     WHERE te.ticket_id = ? ORDER BY te.work_date DESC, te.id DESC`).all(t.id);
   const history = db.prepare(`SELECT h.*, u.name AS user_name FROM ticket_history h LEFT JOIN users u ON u.id = h.user_id
     WHERE h.ticket_id = ? ORDER BY h.created_at DESC, h.id DESC`).all(t.id);
+  const attachments = db.prepare(`SELECT a.id, a.filename, a.mime, a.size, a.user_id, a.created_at, u.name AS user_name
+    FROM attachments a LEFT JOIN users u ON u.id = a.user_id WHERE a.ticket_id = ? ORDER BY a.created_at`).all(t.id);
   res.json({
     ticket: decorate({ ...t, time_minutes: time.reduce((s, e) => s + e.minutes, 0) }, policies(), settings),
-    comments, time, history,
+    comments,
+    time: isClient ? [] : time,
+    history: isClient ? [] : history,
+    attachments,
   });
 }));
 
@@ -235,6 +276,7 @@ app.patch('/api/tickets/:id', staff, wrap((req, res) => {
   for (const f of ['title', 'description', 'category', 'requester_name', 'requester_email', 'ms_case', 'resolution']) {
     if (b[f] !== undefined && String(b[f]) !== t[f]) upd[f] = String(b[f]);
   }
+  if (upd.title !== undefined && !upd.title.trim()) throw new HttpError(400, 'Title is required');
   if (b.type !== undefined && TYPES.includes(b.type) && b.type !== t.type) upd.type = b.type;
   if (b.assignee_id !== undefined) {
     const a = b.assignee_id ? Number(b.assignee_id) : null;
@@ -246,9 +288,9 @@ app.patch('/api/tickets/:id', staff, wrap((req, res) => {
   const policy = pols[b.priority && pols[b.priority] ? b.priority : t.priority];
 
   if (b.status !== undefined && b.status !== t.status) {
-    if (!STATUSES.includes(b.status)) throw new HttpError(400, 'Statut invalide');
+    if (!STATUSES.includes(b.status)) throw new HttpError(400, 'Invalid status');
     upd.status = b.status;
-    // Pause / reprise de l'horloge SLA de résolution
+    // Pause / resume the resolution SLA clock
     if (PAUSE_STATUSES.includes(b.status) && !pausedAt) pausedAt = now;
     if (!PAUSE_STATUSES.includes(b.status) && pausedAt) {
       pausedMinutes += sla.minutesBetween(pausedAt, now, pols[t.priority], settings.business_hours);
@@ -267,7 +309,7 @@ app.patch('/api/tickets/:id', staff, wrap((req, res) => {
   }
 
   if (b.priority !== undefined && b.priority !== t.priority) {
-    if (!pols[b.priority]) throw new HttpError(400, 'Priorité invalide');
+    if (!pols[b.priority]) throw new HttpError(400, 'Invalid priority');
     upd.priority = b.priority;
   }
   if (upd.priority || upd.paused_minutes !== undefined) {
@@ -289,21 +331,23 @@ app.patch('/api/tickets/:id', staff, wrap((req, res) => {
 }));
 
 app.delete('/api/tickets/:id', admin, wrap((req, res) => {
-  loadTicket(req.params.id);
-  db.prepare('DELETE FROM tickets WHERE id = ?').run(Number(req.params.id));
+  const t = loadTicket(req.params.id);
+  const files = db.prepare('SELECT stored_as FROM attachments WHERE ticket_id = ?').all(t.id);
+  db.prepare('DELETE FROM tickets WHERE id = ?').run(t.id);
+  for (const f of files) fs.rm(path.join(UPLOAD_DIR, f.stored_as), { force: true }, () => {});
   res.json({ ok: true });
 }));
 
 app.post('/api/tickets/:id/comments', wrap((req, res) => {
   const t = loadTicket(req.params.id);
   const body = String(req.body?.body || '').trim();
-  if (!body) throw new HttpError(400, 'Commentaire vide');
+  if (!body) throw new HttpError(400, 'Comment is empty');
   const isStaff = req.user.role !== 'client';
   const internal = isStaff && req.body?.internal ? 1 : 0;
   const now = Date.now();
   db.prepare('INSERT INTO comments (ticket_id, user_id, body, internal, created_at) VALUES (?, ?, ?, ?, ?)')
     .run(t.id, req.user.id, body, internal, now);
-  // Une réponse publique de l'équipe support compte comme première réponse SLA
+  // A public reply from the support team counts as the SLA first response
   if (isStaff && !internal && !t.first_response_at) {
     db.prepare('UPDATE tickets SET first_response_at = ?, updated_at = ? WHERE id = ?').run(now, now, t.id);
   } else {
@@ -312,13 +356,58 @@ app.post('/api/tickets/:id/comments', wrap((req, res) => {
   res.status(201).json({ ok: true });
 }));
 
-// ---------- temps passé ----------
+// ---------- attachments ----------
+
+app.post('/api/tickets/:id/attachments',
+  express.raw({ type: () => true, limit: `${MAX_UPLOAD_MB}mb` }),
+  wrap((req, res) => {
+    const t = loadTicket(req.params.id);
+    if (!Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Empty file');
+    let filename = 'file';
+    try { filename = decodeURIComponent(req.get('x-filename') || 'file'); } catch { /* keep default */ }
+    filename = path.basename(filename).replace(/[\u0000-\u001f"\\/]/g, '_').slice(0, 200) || 'file';
+    const mime = String(req.get('x-mime') || 'application/octet-stream').split(';')[0].slice(0, 100);
+    const storedAs = `${t.id}-${crypto.randomBytes(12).toString('hex')}`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, storedAs), req.body);
+    const now = Date.now();
+    db.prepare(`INSERT INTO attachments (ticket_id, user_id, filename, mime, size, stored_as, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(t.id, req.user.id, filename, mime, req.body.length, storedAs, now);
+    db.prepare('UPDATE tickets SET updated_at = ? WHERE id = ?').run(now, t.id);
+    res.status(201).json({ ok: true });
+  }));
+
+function loadAttachment(id) {
+  const a = db.prepare('SELECT * FROM attachments WHERE id = ?').get(Number(id));
+  if (!a) throw new HttpError(404, 'Attachment not found');
+  return a;
+}
+
+app.get('/api/attachments/:id', wrap((req, res) => {
+  const a = loadAttachment(req.params.id);
+  const file = path.join(UPLOAD_DIR, a.stored_as);
+  if (!fs.existsSync(file)) throw new HttpError(404, 'File missing on disk');
+  // Only images are rendered inline; everything else is forced to download
+  const inline = /^image\/(png|jpe?g|gif|webp)$/.test(a.mime) && req.query.inline === '1';
+  res.set('Content-Type', inline ? a.mime : 'application/octet-stream');
+  res.set('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(a.filename)}`);
+  res.sendFile(file);
+}));
+
+app.delete('/api/attachments/:id', staff, wrap((req, res) => {
+  const a = loadAttachment(req.params.id);
+  if (req.user.role !== 'admin' && a.user_id !== req.user.id) throw new HttpError(403, 'Access denied');
+  db.prepare('DELETE FROM attachments WHERE id = ?').run(a.id);
+  fs.rm(path.join(UPLOAD_DIR, a.stored_as), { force: true }, () => {});
+  res.json({ ok: true });
+}));
+
+// ---------- time tracking ----------
 
 function validateEntry(b) {
   const minutes = Math.round(Number(b.minutes));
-  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) throw new HttpError(400, 'Durée invalide');
+  if (!Number.isFinite(minutes) || minutes <= 0 || minutes > 24 * 60) throw new HttpError(400, 'Invalid duration');
   const workDate = String(b.work_date || '');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) throw new HttpError(400, 'Date invalide');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) throw new HttpError(400, 'Invalid date');
   return { minutes, workDate };
 }
 
@@ -346,8 +435,8 @@ app.post('/api/time', staff, wrap((req, res) => {
 
 app.patch('/api/time/:id', staff, wrap((req, res) => {
   const e = db.prepare('SELECT * FROM time_entries WHERE id = ?').get(Number(req.params.id));
-  if (!e) throw new HttpError(404, 'Saisie introuvable');
-  if (req.user.role !== 'admin' && e.user_id !== req.user.id) throw new HttpError(403, 'Accès refusé');
+  if (!e) throw new HttpError(404, 'Time entry not found');
+  if (req.user.role !== 'admin' && e.user_id !== req.user.id) throw new HttpError(403, 'Access denied');
   const b = { ...e, ...req.body };
   const { minutes, workDate } = validateEntry(b);
   db.prepare('UPDATE time_entries SET work_date = ?, minutes = ?, description = ?, billable = ? WHERE id = ?')
@@ -357,13 +446,13 @@ app.patch('/api/time/:id', staff, wrap((req, res) => {
 
 app.delete('/api/time/:id', staff, wrap((req, res) => {
   const e = db.prepare('SELECT * FROM time_entries WHERE id = ?').get(Number(req.params.id));
-  if (!e) throw new HttpError(404, 'Saisie introuvable');
-  if (req.user.role !== 'admin' && e.user_id !== req.user.id) throw new HttpError(403, 'Accès refusé');
+  if (!e) throw new HttpError(404, 'Time entry not found');
+  if (req.user.role !== 'admin' && e.user_id !== req.user.id) throw new HttpError(403, 'Access denied');
   db.prepare('DELETE FROM time_entries WHERE id = ?').run(e.id);
   res.json({ ok: true });
 }));
 
-// ---------- tableau de bord & rapports ----------
+// ---------- dashboard & reports ----------
 
 function hoursByMonth(settings, months = 12) {
   const cur = currentMonth(settings);
@@ -398,18 +487,32 @@ app.get('/api/dashboard', wrap((req, res) => {
   const resolved = db.prepare('SELECT COUNT(*) AS n FROM tickets WHERE resolved_at >= ? AND resolved_at < ?').get(r.from, r.to).n;
   const byPriority = {};
   for (const p of Object.keys(pols)) byPriority[p] = open.filter((t) => t.priority === p).length;
+  const byStatus = {};
+  for (const t of open) byStatus[t.status] = (byStatus[t.status] || 0) + 1;
   const recent = db.prepare(`SELECT t.*, a.name AS assignee_name FROM tickets t LEFT JOIN users a ON a.id = t.assignee_id
     ORDER BY t.updated_at DESC LIMIT 8`).all().map((t) => decorate(t, pols, settings, now));
+  const mine = req.user.role === 'client' ? [] : open.filter((t) => t.assignee_id === req.user.id);
+  const report = monthlyReport(month, settings);
+  // Linear projection of billable hours to the end of the month
+  const [y, m] = month.split('-').map(Number);
+  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const today = Number(new Date(now + (settings.business_hours?.offset || 0) * 60000).toISOString().slice(8, 10));
   res.json({
     month,
     contract_minutes: (Number(settings.contract_hours_month) || 0) * 60,
     used_minutes: used,
+    projected_minutes: Math.round((used / Math.max(1, today)) * daysInMonth),
     open_count: open.length,
     created, resolved,
     by_priority: byPriority,
+    by_status: byStatus,
+    sla_response_pct: report.sla.response_pct,
+    sla_resolution_pct: report.sla.resolution_pct,
     breached: open.filter((t) => t.sla_response === 'breached' || t.sla_resolution === 'breached'),
-    at_risk: open.filter((t) => t.sla_response === 'at_risk' || t.sla_resolution === 'at_risk'),
+    at_risk: open.filter((t) => t.sla_response !== 'breached' && t.sla_resolution !== 'breached'
+      && (t.sla_response === 'at_risk' || t.sla_resolution === 'at_risk')),
     unassigned: open.filter((t) => !t.assignee_id).length,
+    mine,
     recent,
     trend: hoursByMonth(settings, 6),
   });
@@ -428,7 +531,7 @@ function monthlyReport(month, settings) {
     .all(r.dayFrom, r.dayTo, r.from, r.to).map(deco);
   const resolved = db.prepare(`${baseSel} WHERE t.resolved_at >= ? AND t.resolved_at < ? ORDER BY t.resolved_at`)
     .all(r.dayFrom, r.dayTo, r.from, r.to).map(deco);
-  // Tous les tickets traités dans le mois : créés, résolus, ou avec du temps saisi
+  // Every ticket handled during the month: created, resolved, time logged, or still open over the period
   const worked = db.prepare(`${baseSel} WHERE (t.created_at >= ? AND t.created_at < ?)
       OR (t.resolved_at >= ? AND t.resolved_at < ?)
       OR t.id IN (SELECT ticket_id FROM time_entries WHERE work_date >= ? AND work_date < ? AND ticket_id IS NOT NULL)
@@ -443,8 +546,8 @@ function monthlyReport(month, settings) {
   const sum = (list, key, val) => list.reduce((acc, x) => { const k = x[key] || '—'; acc[k] = (acc[k] || 0) + val(x); return acc; }, {});
   const pct = (ok, total) => (total ? Math.round((ok / total) * 1000) / 10 : null);
 
-  // Conformité SLA : réponse sur les tickets créés dans le mois (hors en cours dans les délais),
-  // résolution sur les tickets résolus dans le mois.
+  // SLA compliance: response on tickets created this month (only once met or breached),
+  // resolution on tickets resolved this month.
   const respEval = created.filter((t) => t.sla_response === 'met' || t.sla_response === 'breached');
   const resEval = resolved.filter((t) => t.status !== 'cancelled');
   const billable = entries.filter((e) => e.billable).reduce((s, e) => s + e.minutes, 0);
@@ -452,11 +555,13 @@ function monthlyReport(month, settings) {
   const contract = (Number(settings.contract_hours_month) || 0) * 60;
 
   const catMinutes = {};
+  const byId = new Map(worked.map((w) => [w.id, w]));
   for (const e of entries) {
-    const t = e.ticket_id ? worked.find((w) => w.id === e.ticket_id) : null;
-    const k = t ? (t.category || '—') : 'Hors ticket';
+    const t = e.ticket_id ? byId.get(e.ticket_id) : null;
+    const k = t ? (t.category || '—') : 'Non-ticket work';
     catMinutes[k] = (catMinutes[k] || 0) + e.minutes;
   }
+  const resolvedTimes = resEval.map((t) => (t.resolved_at - t.created_at) / 60000);
 
   return {
     month,
@@ -478,6 +583,7 @@ function monthlyReport(month, settings) {
       created: created.length,
       resolved: resolved.length,
       open_end_of_month: worked.filter((t) => t.created_at < r.to && (!t.resolved_at || t.resolved_at >= r.to) && t.status !== 'cancelled').length,
+      avg_resolution_minutes: resolvedTimes.length ? Math.round(resolvedTimes.reduce((a, b) => a + b, 0) / resolvedTimes.length) : null,
       by_priority: count(created, 'priority'),
       by_type: count(created, 'type'),
       by_category: count(created, 'category'),
@@ -510,8 +616,9 @@ app.get('/api/reports/monthly', wrap((req, res) => {
   const settings = getSettings();
   const report = monthlyReport(req.query.month || currentMonth(settings), settings);
   if (req.user.role === 'client') {
-    // Le client voit la synthèse et les saisies, sans le détail par intervenant
+    // Clients see the summary and entries, without the per-engineer breakdown
     report.hours.by_user = {};
+    report.entries = report.entries.map(({ user_name, ...e }) => e);
   }
   res.json(report);
 }));
@@ -521,7 +628,7 @@ function csv(rows, columns) {
     const s = v == null ? '' : String(v);
     return /[",;\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  return '﻿' + [columns.map((c) => esc(c[0])).join(';'), ...rows.map((r) => columns.map((c) => esc(c[1](r))).join(';'))].join('\r\n');
+  return '﻿' + [columns.map((c) => esc(c[0])).join(','), ...rows.map((r) => columns.map((c) => esc(c[1](r))).join(','))].join('\r\n');
 }
 
 const fmtDate = (ms, settings) => (ms ? new Date(ms + (settings.business_hours?.offset || 0) * 60000).toISOString().slice(0, 16).replace('T', ' ') : '');
@@ -534,20 +641,20 @@ app.get('/api/reports/monthly.csv', wrap((req, res) => {
   let body;
   if (kind === 'tickets') {
     body = csv(report.ticket_list, [
-      ['Numéro', (t) => t.number], ['Titre', (t) => t.title], ['Type', (t) => t.type], ['Priorité', (t) => t.priority],
-      ['Statut', (t) => t.status], ['Catégorie', (t) => t.category], ['Demandeur', (t) => t.requester_name],
-      ['Assigné', (t) => t.assignee_name], ['Cas Microsoft', (t) => t.ms_case],
-      ['Créé le', (t) => fmtDate(t.created_at, settings)], ['1re réponse', (t) => fmtDate(t.first_response_at, settings)],
-      ['Résolu le', (t) => fmtDate(t.resolved_at, settings)], ['SLA réponse', (t) => t.sla_response],
-      ['SLA résolution', (t) => t.sla_resolution], ['Heures (mois)', (t) => (t.month_minutes / 60).toFixed(2).replace('.', ',')],
-      ['Heures (total)', (t) => (t.time_minutes / 60).toFixed(2).replace('.', ',')],
+      ['Number', (t) => t.number], ['Title', (t) => t.title], ['Type', (t) => t.type], ['Priority', (t) => t.priority],
+      ['Status', (t) => t.status], ['Category', (t) => t.category], ['Requester', (t) => t.requester_name],
+      ['Assignee', (t) => t.assignee_name], ['Microsoft case', (t) => t.ms_case],
+      ['Created', (t) => fmtDate(t.created_at, settings)], ['First response', (t) => fmtDate(t.first_response_at, settings)],
+      ['Resolved', (t) => fmtDate(t.resolved_at, settings)], ['Response SLA', (t) => t.sla_response],
+      ['Resolution SLA', (t) => t.sla_resolution], ['Hours (month)', (t) => (t.month_minutes / 60).toFixed(2)],
+      ['Hours (total)', (t) => (t.time_minutes / 60).toFixed(2)],
     ]);
   } else {
     body = csv(report.entries, [
-      ['Date', (e) => e.work_date], ['Ticket', (e) => e.ticket_number || ''], ['Titre ticket', (e) => e.ticket_title || ''],
-      ['Intervenant', (e) => (req.user.role === 'client' ? '' : e.user_name)], ['Description', (e) => e.description],
-      ['Minutes', (e) => e.minutes], ['Heures', (e) => (e.minutes / 60).toFixed(2).replace('.', ',')],
-      ['Facturable', (e) => (e.billable ? 'Oui' : 'Non')],
+      ['Date', (e) => e.work_date], ['Ticket', (e) => e.ticket_number || ''], ['Ticket title', (e) => e.ticket_title || ''],
+      ['Engineer', (e) => (req.user.role === 'client' ? '' : e.user_name)], ['Description', (e) => e.description],
+      ['Minutes', (e) => e.minutes], ['Hours', (e) => (e.minutes / 60).toFixed(2)],
+      ['Billable', (e) => (e.billable ? 'Yes' : 'No')],
     ]);
   }
   res.set('Content-Type', 'text/csv; charset=utf-8');
@@ -564,11 +671,11 @@ app.put('/api/settings', admin, wrap((req, res) => {
     let v = b[key];
     if (key === 'contract_hours_month' || key === 'alert_threshold_pct') {
       v = Number(v);
-      if (!Number.isFinite(v) || v < 0) throw new HttpError(400, `Valeur invalide : ${key}`);
+      if (!Number.isFinite(v) || v < 0) throw new HttpError(400, `Invalid value: ${key}`);
     }
-    if (key === 'categories' && !Array.isArray(v)) throw new HttpError(400, 'Catégories invalides');
+    if (key === 'categories' && !Array.isArray(v)) throw new HttpError(400, 'Invalid categories');
     if (key === 'business_hours') {
-      if (!/^\d{2}:\d{2}$/.test(v.start) || !/^\d{2}:\d{2}$/.test(v.end)) throw new HttpError(400, 'Heures ouvrées invalides');
+      if (!/^\d{2}:\d{2}$/.test(v.start) || !/^\d{2}:\d{2}$/.test(v.end)) throw new HttpError(400, 'Invalid business hours');
       v = { offset: Number(v.offset) || 0, days: (v.days || []).map(Number).filter((d) => d >= 0 && d <= 6), start: v.start, end: v.end };
     }
     setSetting(key, v);
@@ -579,10 +686,10 @@ app.put('/api/settings', admin, wrap((req, res) => {
 app.put('/api/sla/:priority', admin, wrap((req, res) => {
   const b = req.body || {};
   const p = db.prepare('SELECT * FROM sla_policies WHERE priority = ?').get(req.params.priority);
-  if (!p) throw new HttpError(404, 'Priorité inconnue');
+  if (!p) throw new HttpError(404, 'Unknown priority');
   const resp = Math.round(Number(b.response_min ?? p.response_min));
   const reso = Math.round(Number(b.resolution_min ?? p.resolution_min));
-  if (!(resp > 0 && reso > 0)) throw new HttpError(400, 'Délais invalides');
+  if (!(resp > 0 && reso > 0)) throw new HttpError(400, 'Invalid targets');
   db.prepare('UPDATE sla_policies SET name = ?, response_min = ?, resolution_min = ?, business_hours = ? WHERE priority = ?')
     .run(String(b.name ?? p.name), resp, reso, b.business_hours ? 1 : 0, p.priority);
   if (b.recalculate) recalcOpenTickets();
@@ -609,14 +716,14 @@ app.get('/api/users', admin, wrap((req, res) => {
 
 app.post('/api/users', admin, wrap((req, res) => {
   const b = req.body || {};
-  if (!b.name || !b.email) throw new HttpError(400, 'Nom et email obligatoires');
-  if (!['admin', 'engineer', 'client'].includes(b.role)) throw new HttpError(400, 'Rôle invalide');
-  if (String(b.password || '').length < 8) throw new HttpError(400, 'Mot de passe : 8 caractères minimum');
+  if (!b.name || !b.email) throw new HttpError(400, 'Name and email are required');
+  if (!['admin', 'engineer', 'client'].includes(b.role)) throw new HttpError(400, 'Invalid role');
+  if (String(b.password || '').length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
   try {
     db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
       .run(String(b.name), String(b.email).trim(), hashPassword(b.password), b.role, Date.now());
   } catch (e) {
-    if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'Cet email existe déjà');
+    if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'This email already exists');
     throw e;
   }
   res.status(201).json({ ok: true });
@@ -624,35 +731,77 @@ app.post('/api/users', admin, wrap((req, res) => {
 
 app.patch('/api/users/:id', admin, wrap((req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE id = ?').get(Number(req.params.id));
-  if (!u) throw new HttpError(404, 'Utilisateur introuvable');
+  if (!u) throw new HttpError(404, 'User not found');
   const b = req.body || {};
   if (u.id === req.user.id && (b.active === false || (b.role && b.role !== 'admin'))) {
-    throw new HttpError(400, 'Vous ne pouvez pas désactiver ou rétrograder votre propre compte');
+    throw new HttpError(400, 'You cannot deactivate or demote your own account');
   }
   const role = ['admin', 'engineer', 'client'].includes(b.role) ? b.role : u.role;
   const active = b.active === undefined ? u.active : (b.active ? 1 : 0);
-  db.prepare('UPDATE users SET name = ?, email = ?, role = ?, active = ? WHERE id = ?')
-    .run(String(b.name ?? u.name), String(b.email ?? u.email).trim(), role, active, u.id);
+  try {
+    db.prepare('UPDATE users SET name = ?, email = ?, role = ?, active = ? WHERE id = ?')
+      .run(String(b.name ?? u.name), String(b.email ?? u.email).trim(), role, active, u.id);
+  } catch (e) {
+    if (/UNIQUE/.test(e.message)) throw new HttpError(409, 'This email already exists');
+    throw e;
+  }
   if (b.password) {
-    if (String(b.password).length < 8) throw new HttpError(400, 'Mot de passe : 8 caractères minimum');
+    if (String(b.password).length < 8) throw new HttpError(400, 'Password must be at least 8 characters');
     db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(b.password), u.id);
   }
   if (!active || b.password) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
   res.json({ ok: true });
 }));
 
-// ---------- erreurs ----------
+function dirSize(dir) {
+  let total = 0;
+  for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (f.isFile()) total += fs.statSync(path.join(dir, f.name)).size;
+  }
+  return total;
+}
 
-app.use('/api', (req, _res, next) => next(new HttpError(404, 'Route inconnue')));
+app.get('/api/admin/system', admin, wrap((req, res) => {
+  const size = (f) => (fs.existsSync(f) ? fs.statSync(f).size : 0);
+  const n = (sql) => db.prepare(sql).get().n;
+  res.json({
+    db_file: DB_FILE,
+    db_bytes: size(DB_FILE) + size(`${DB_FILE}-wal`),
+    upload_dir: UPLOAD_DIR,
+    upload_bytes: dirSize(UPLOAD_DIR),
+    counts: {
+      tickets: n('SELECT COUNT(*) AS n FROM tickets'),
+      time_entries: n('SELECT COUNT(*) AS n FROM time_entries'),
+      users: n('SELECT COUNT(*) AS n FROM users'),
+      attachments: n('SELECT COUNT(*) AS n FROM attachments'),
+    },
+    node: process.version,
+    host: os.hostname(),
+  });
+}));
+
+// Consistent hot copy of the SQLite database, downloaded by the browser
+app.get('/api/admin/backup', admin, wrap((req, res) => {
+  const tmp = path.join(os.tmpdir(), `ora-itsm-backup-${crypto.randomBytes(6).toString('hex')}.db`);
+  db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+  res.download(tmp, `ora-itsm-backup-${stamp}.db`, () => fs.rm(tmp, { force: true }, () => {}));
+}));
+
+// ---------- errors ----------
+
+app.use('/api', (req, _res, next) => next(new HttpError(404, 'Unknown route')));
 
 app.use((err, req, res, _next) => {
-  const status = err.status || (err.type === 'entity.parse.failed' ? 400 : 500);
+  let status = err.status || (err.type === 'entity.parse.failed' ? 400 : 500);
+  let message = err.message;
+  if (err.type === 'entity.too.large') { status = 413; message = `File too large (max ${MAX_UPLOAD_MB} MB)`; }
   if (status >= 500) console.error(err);
-  res.status(status).json({ error: status >= 500 ? 'Erreur interne du serveur' : err.message });
+  res.status(status).json({ error: status >= 500 ? 'Internal server error' : message });
 });
 
 if (require.main === module) {
-  app.listen(PORT, () => console.log(`[ora-itsm] Serveur démarré sur http://0.0.0.0:${PORT}`));
+  app.listen(PORT, () => console.log(`[ora-itsm] Server running at http://localhost:${PORT}`));
 }
 
 module.exports = app;

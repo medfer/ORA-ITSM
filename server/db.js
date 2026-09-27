@@ -3,9 +3,11 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'ora-itsm.db');
+const DB_FILE = path.resolve(process.env.DB_FILE || path.join(DATA_DIR, 'ora-itsm.db'));
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const db = new DatabaseSync(DB_FILE);
 db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
@@ -97,12 +99,24 @@ CREATE TABLE IF NOT EXISTS ticket_history (
   new_value  TEXT,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS attachments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  user_id    INTEGER REFERENCES users(id),
+  filename   TEXT NOT NULL,
+  mime       TEXT NOT NULL DEFAULT 'application/octet-stream',
+  size       INTEGER NOT NULL,
+  stored_as  TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON attachments(ticket_id);
 `);
 
 const DEFAULT_SETTINGS = {
   company_name: 'Black Star Iraq',
   client_name: 'ORA',
-  contract_name: 'Support Microsoft ORA',
+  contract_name: 'ORA Microsoft Support',
   contract_hours_month: 40,
   contract_start: new Date().toISOString().slice(0, 7),
   ticket_prefix: 'ORA',
@@ -110,15 +124,15 @@ const DEFAULT_SETTINGS = {
   business_hours: { offset: 180, days: [0, 1, 2, 3, 4], start: '08:00', end: '16:00' },
   categories: [
     'Microsoft 365', 'Exchange Online', 'Teams', 'SharePoint / OneDrive', 'Entra ID / Active Directory',
-    'Intune / Endpoint', 'Azure', 'Windows Server', 'SQL Server', 'Sécurité / Defender', 'Licences', 'Autre',
+    'Intune / Endpoint', 'Azure', 'Windows Server', 'SQL Server', 'Security / Defender', 'Licensing', 'Other',
   ],
 };
 
 const DEFAULT_SLA = [
-  ['P1', 'Critique', 30, 240, 0],
-  ['P2', 'Haute', 60, 480, 1],
-  ['P3', 'Moyenne', 240, 1440, 1],
-  ['P4', 'Basse', 480, 2400, 1],
+  ['P1', 'Critical', 30, 240, 0],
+  ['P2', 'High', 60, 480, 1],
+  ['P3', 'Medium', 240, 1440, 1],
+  ['P4', 'Low', 480, 2400, 1],
 ];
 
 function hashPassword(password) {
@@ -138,7 +152,7 @@ function verifyPassword(password, stored) {
 function getSettings() {
   const out = { ...DEFAULT_SETTINGS };
   for (const row of db.prepare('SELECT key, value FROM settings').all()) {
-    try { out[row.key] = JSON.parse(row.value); } catch { /* ignore valeur corrompue */ }
+    try { out[row.key] = JSON.parse(row.value); } catch { /* ignore corrupted value */ }
   }
   return out;
 }
@@ -153,19 +167,27 @@ function seed() {
     'INSERT OR IGNORE INTO sla_policies (priority, name, response_min, resolution_min, business_hours) VALUES (?, ?, ?, ?, ?)');
   for (const p of DEFAULT_SLA) insertPolicy.run(...p);
 
+  // Databases created by the first (French) version: rename untouched default SLA names
+  const legacy = { P1: 'Critique', P2: 'Haute', P3: 'Moyenne', P4: 'Basse' };
+  const rename = db.prepare('UPDATE sla_policies SET name = ? WHERE priority = ? AND name = ?');
+  for (const [p, name] of DEFAULT_SLA) rename.run(name, p, legacy[p]);
+
   const { n } = db.prepare('SELECT COUNT(*) AS n FROM users').get();
   if (n === 0) {
     const email = process.env.ADMIN_EMAIL || 'admin@ora-itsm.local';
     const password = process.env.ADMIN_PASSWORD || 'ChangeMe!2026';
     db.prepare('INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run('Administrateur', email, hashPassword(password), 'admin', Date.now());
-    console.log(`[ora-itsm] Compte admin créé : ${email} (changez le mot de passe après la première connexion)`);
+      .run('Administrator', email, hashPassword(password), 'admin', Date.now());
+    console.log(`[ora-itsm] Admin account created: ${email} (change the password after first login)`);
   } else {
     const admins = db.prepare("SELECT email FROM users WHERE role = 'admin' AND active = 1").all().map((u) => u.email);
-    console.log(`[ora-itsm] Comptes admin : ${admins.join(', ') || 'aucun'} (ADMIN_EMAIL/ADMIN_PASSWORD ignorés : la base existe déjà)`);
+    console.log(`[ora-itsm] Admin accounts: ${admins.join(', ') || 'none'} (ADMIN_EMAIL/ADMIN_PASSWORD ignored: database already exists)`);
   }
+  console.log(`[ora-itsm] Database: ${DB_FILE}`);
 }
 
 seed();
 
-module.exports = { db, DB_FILE, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS };
+module.exports = {
+  db, DATA_DIR, DB_FILE, UPLOAD_DIR, getSettings, setSetting, hashPassword, verifyPassword, DEFAULT_SETTINGS,
+};
