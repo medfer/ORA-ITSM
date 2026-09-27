@@ -99,17 +99,23 @@ docker compose -f docker-compose.prod.yml logs -f caddy   # wait for "certificat
 
 Open `https://itsm.your-domain.com`. Updates: `git pull && docker compose -f docker-compose.prod.yml up -d --build`.
 
-**3b. Windows Server (without Docker)**
+**3b. Windows Server / Azure Windows VM (without Docker)** — one script does everything
 
-1. Install Node.js 22 LTS, copy the project to `C:\ora-itsm`, run `npm install --omit=dev`.
-2. Run ORA ITSM as a Windows service with [NSSM](https://nssm.cc):
-   `nssm install ORA-ITSM "C:\Program Files\nodejs\node.exe" "--env-file-if-exists=.env --disable-warning=ExperimentalWarning server\index.js"`,
-   set *Startup directory* to `C:\ora-itsm`, then `nssm start ORA-ITSM`.
-3. Download `caddy.exe` (https://caddyserver.com/download, Windows amd64) into `C:\caddy`, copy `deploy\Caddyfile.windows` there as `Caddyfile`,
-   replace the domain and email, and install it as a service too:
-   `nssm install Caddy C:\caddy\caddy.exe "run --config C:\caddy\Caddyfile"` then `nssm start Caddy`.
-4. Windows Firewall: allow inbound TCP 80 and 443
-   (`New-NetFirewallRule -DisplayName "HTTP/HTTPS" -Direction Inbound -Protocol TCP -LocalPort 80,443 -Action Allow`).
+1. Install **Node.js 22 LTS** (https://nodejs.org) and **Git** (https://git-scm.com/download/win) on the server.
+2. Open **PowerShell as administrator** and run:
+
+```powershell
+git clone -b claude/loving-bardeen-ltstxx https://github.com/medfer/ora-itsm.git C:\ora-itsm
+powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\install.ps1 -Domain ora-itsm.duckdns.org -Email you@example.com
+```
+
+The script installs dependencies, downloads Caddy to `C:\caddy`, writes and validates the Caddyfile, opens ports 80/443
+in Windows Firewall, registers two scheduled tasks that start with Windows (`ORA-ITSM` and `ORA-ITSM-Caddy`, restarted on failure),
+then checks that `https://<domain>` answers. Caddy log: `C:\caddy\caddy.log`.
+
+Update later with: `powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\update.ps1` (backs up the database first).
+
+To move existing data from another PC: stop the task (`Stop-ScheduledTask ORA-ITSM`), copy your `data` folder into `C:\ora-itsm\data`, then `Start-ScheduledTask ORA-ITSM`.
 
 **Before giving access to the client:** change the admin password, create the user accounts, and schedule backups.
 
