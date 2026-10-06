@@ -49,8 +49,7 @@ Stop-OraApp
 Step 'Installing application dependencies'
 Push-Location $AppDir
 try {
-  & npm.cmd install --omit=dev --no-audit --no-fund
-  if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+  Invoke-Native 'npm.cmd' @('install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error') 'npm install failed'
 } finally { Pop-Location }
 
 Step 'Downloading Caddy (web server with automatic HTTPS)'

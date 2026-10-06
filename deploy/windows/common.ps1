@@ -80,6 +80,15 @@ function Start-OraApp {
   return (Wait-OraHealth 45)
 }
 
+# Runs git / npm / node: their progress messages on stderr ("npm notice", "From https://...")
+# must not be treated as PowerShell errors. Throws only if the exit code is not 0.
+function Invoke-Native([string]$Exe, [string[]]$Arguments, [string]$ErrorMessage) {
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & $Exe @Arguments 2>&1 | ForEach-Object { Write-Host "  $_" } } finally { $ErrorActionPreference = $previous }
+  if ($LASTEXITCODE -ne 0) { throw "$ErrorMessage (exit code $LASTEXITCODE)" }
+}
+
 function Get-PowerShellExe { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
 
 # Argument string to run one of the scripts of this folder hidden

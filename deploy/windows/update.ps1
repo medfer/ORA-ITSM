@@ -15,18 +15,16 @@ Set-Location $OraAppDir
 $node = Get-OraNode
 
 Write-Host '==> Backing up the database' -ForegroundColor Cyan
-& $node --env-file-if-exists=.env --disable-warning=ExperimentalWarning server\backup.js backups --prefix pre-update --keep 10 --db-only
-if ($LASTEXITCODE -ne 0) { throw 'Backup failed - update cancelled' }
+Invoke-Native $node @('--env-file-if-exists=.env', '--disable-warning=ExperimentalWarning', 'server\backup.js', 'backups',
+  '--prefix', 'pre-update', '--keep', '10', '--db-only') 'Backup failed - update cancelled'
 
 Write-Host '==> Stopping ORA ITSM' -ForegroundColor Cyan
 Stop-OraApp
 
 try {
   Write-Host '==> Downloading the latest version' -ForegroundColor Cyan
-  & git.exe pull
-  if ($LASTEXITCODE -ne 0) { throw 'git pull failed' }
-  & npm.cmd install --omit=dev --no-audit --no-fund
-  if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+  Invoke-Native 'git.exe' @('pull') 'git pull failed'
+  Invoke-Native 'npm.cmd' @('install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error') 'npm install failed'
 } finally {
   if (-not $RefreshTasks) {
     Write-Host '==> Starting ORA ITSM' -ForegroundColor Cyan
