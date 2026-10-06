@@ -111,12 +111,45 @@ powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\install.ps1 
 ```
 
 The script installs dependencies, downloads Caddy to `C:\caddy`, writes and validates the Caddyfile, opens ports 80/443
-in Windows Firewall, registers two scheduled tasks that start with Windows (`ORA-ITSM` and `ORA-ITSM-Caddy`, restarted on failure),
-then checks that `https://<domain>` answers. Caddy log: `C:\caddy\caddy.log`.
+in Windows Firewall, creates the scheduled tasks below (via `tasks.ps1`), then checks that `https://<domain>` answers.
+Optional: `-BackupDir D:\Backups\ora-itsm -BackupTime 01:30 -KeepBackups 60`.
 
-Update later with: `powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\update.ps1` (backs up the database first).
+#### Automatic start, watchdog and backups (scheduled tasks)
 
-To move existing data from another PC: stop the task (`Stop-ScheduledTask ORA-ITSM`), copy your `data` folder into `C:\ora-itsm\data`, then `Start-ScheduledTask ORA-ITSM`.
+All tasks run as **SYSTEM**, whether or not someone is signed in to the server:
+
+| Task | When | What it does |
+|---|---|---|
+| `ORA-ITSM` | at Windows startup (+30 s) | supervisor `run-app.ps1`: runs Node.js, writes its output to `logs\app-*.log`, **restarts it within seconds if it crashes** (longer pauses if it crashes in a loop) |
+| `ORA-ITSM-Caddy` | at Windows startup | HTTPS reverse proxy (log: `C:\caddy\caddy.log`) |
+| `ORA-ITSM-Watchdog` | every 5 minutes | starts the application / Caddy if they are not running, restarts the application if `/api/health` does not answer (`logs\watchdog.log`) |
+| `ORA-ITSM-Backup` | every day at 02:00 | hot backup of the database **and attachments** to `backups\`, keeps the last 30 (`logs\backup.log`) |
+
+Manage them with `tasks.ps1` (PowerShell as administrator):
+
+```powershell
+$t = 'C:\ora-itsm\deploy\windows\tasks.ps1'
+powershell -ExecutionPolicy Bypass -File $t -Action Status     # state of each task + health check
+powershell -ExecutionPolicy Bypass -File $t -Action Restart
+powershell -ExecutionPolicy Bypass -File $t -Action Stop       # stays stopped (even after a reboot) until -Action Start
+powershell -ExecutionPolicy Bypass -File $t -Action Start
+powershell -ExecutionPolicy Bypass -File $t -Action Install -BackupDir D:\Backups\ora-itsm -BackupTime 01:30 -KeepBackups 60
+powershell -ExecutionPolicy Bypass -File $t -Action Remove     # removes the tasks, keeps data, logs and backups
+```
+
+`-Action Install` only (re)creates the tasks — useful when the app already runs without HTTPS (e.g. behind another proxy)
+or to change the backup schedule. Add `-NoWatchdog` or `-NoBackup` to skip those tasks.
+Backup by hand: `powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\backup.ps1 [-Destination D:\Backups] [-Keep 30]`.
+
+> Keep the backups on **another disk or server** (`-BackupDir`): a copy on the same disk does not survive a disk failure.
+
+**Upgrading from an installation made before these tasks existed:** run `update.ps1`, then once
+`tasks.ps1 -Action Install` (with your backup options) to switch to the supervisor, watchdog and backup tasks.
+
+Update later with: `powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\update.ps1`
+(backs up the database to `backups\pre-update-*.db` first; add `-RefreshTasks` to re-create the tasks after the update).
+
+To move existing data from another PC: `tasks.ps1 -Action Stop`, copy your `data` folder into `C:\ora-itsm\data`, then `tasks.ps1 -Action Start`.
 
 **Before giving access to the client:** change the admin password, create the user accounts, and schedule backups.
 
@@ -230,6 +263,10 @@ docker compose exec ora-itsm node server/add-user.js it@ora.iq 'OraClient!2026' 
 ## Backup & restore
 
 - **From the app:** Settings → Database & backup → **Download backup** (consistent copy even while running).
+- **Scheduled (Windows):** the `ORA-ITSM-Backup` task (see above).
+- **Command line (any OS, app running or not):** `node --env-file-if-exists=.env server/backup.js <folder> --keep 30`
+  copies the database (`ora-itsm-<date>.db`) and attachments (`ora-itsm-<date>-uploads`), and deletes older ones
+  (`--db-only` to skip attachments). On Linux, schedule it with cron.
 - **Restore:** stop the app, replace `ora-itsm.db` with the backup file (delete any `ora-itsm.db-wal` / `-shm` files next to it), start again.
 - Attachments are regular files in the `uploads/` folder next to the database: copy that folder as well.
 
@@ -275,6 +312,8 @@ server/sso.js             Microsoft Entra ID token verification
 server/mailer.js          Office 365 email delivery (Microsoft Graph), queue and log
 server/notify.js          notification rules and email templates
 server/reset-password.js  command-line password reset
+server/backup.js          command-line hot backup with rotation
+deploy/windows/           Windows Server: install, update, scheduled tasks (tasks.ps1), supervisor, watchdog, backup
 public/                   web interface (index.html, app.js, style.css)
 test/                     node:test tests
 start-windows.bat         Windows launcher

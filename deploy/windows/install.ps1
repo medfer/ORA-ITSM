@@ -1,10 +1,15 @@
 <#
 .SYNOPSIS
   Installs ORA ITSM on Windows Server, published over HTTPS with Caddy (free Let's Encrypt certificate).
-  The application and Caddy start automatically with Windows (scheduled tasks running as SYSTEM).
+  The application and Caddy start automatically with Windows (scheduled tasks running as SYSTEM, see tasks.ps1),
+  a watchdog restarts them if they stop, and a daily backup is scheduled.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\install.ps1 -Domain ora-itsm.duckdns.org -Email you@example.com
+
+.EXAMPLE
+  # Backups on another disk every day at 01:30, keep 60
+  powershell -ExecutionPolicy Bypass -File C:\ora-itsm\deploy\windows\install.ps1 -Domain itsm.example.com -Email you@example.com -BackupDir D:\Backups\ora-itsm -BackupTime 01:30 -KeepBackups 60
 
 .NOTES
   Run in PowerShell opened with "Run as administrator". Requires Node.js 22 LTS or later.
@@ -13,38 +18,33 @@
 param(
   [Parameter(Mandatory = $true)][string]$Domain,
   [Parameter(Mandatory = $true)][string]$Email,
-  [string]$CaddyDir = 'C:\caddy'
+  [string]$CaddyDir = 'C:\caddy',
+  [string]$BackupDir,
+  [string]$BackupTime = '02:00',
+  [int]$KeepBackups = 30
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'  # much faster downloads in Windows PowerShell
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$AppTask = 'ORA-ITSM'
-$CaddyTask = 'ORA-ITSM-Caddy'
-$Port = 8080
+. (Join-Path $PSScriptRoot 'common.ps1')
+$Port = Get-OraPort
 
 function Step([string]$Message) { Write-Host "`n==> $Message" -ForegroundColor Cyan }
 
-$identity = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  throw 'Please run this script in PowerShell opened with "Run as administrator".'
-}
-
-$AppDir = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+Assert-Admin
+$AppDir = $OraAppDir
 Write-Host "Application folder: $AppDir"
 
 Step 'Checking Node.js'
-$node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
-if (-not $node) { throw 'Node.js is not installed. Install Node.js 22 LTS from https://nodejs.org, reopen PowerShell and run this script again.' }
+$node = Get-OraNode
 $version = (& $node -v).TrimStart('v')
 if ([int]$version.Split('.')[0] -lt 22) { throw "Node.js $version found; version 22 or later is required." }
 Write-Host "Node.js $version ($node)"
 
 Step 'Stopping previous instances (if any)'
-foreach ($task in $AppTask, $CaddyTask) {
-  if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $task }
-}
-Start-Sleep -Seconds 2
+if (Get-ScheduledTask -TaskName $OraTasks.Caddy -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $OraTasks.Caddy }
+Stop-OraApp
 
 Step 'Installing application dependencies'
 Push-Location $AppDir
@@ -126,29 +126,12 @@ if (-not (Get-NetFirewallRule -DisplayName 'ORA ITSM HTTP/HTTPS' -ErrorAction Si
   New-NetFirewallRule -DisplayName 'ORA ITSM HTTP/HTTPS' -Direction Inbound -Protocol TCP -LocalPort 80, 443 -Action Allow | Out-Null
 }
 
-function Register-StartupTask([string]$Name, [string]$Execute, [string]$Arguments, [string]$WorkDir) {
-  Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction SilentlyContinue
-  $action = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments -WorkingDirectory $WorkDir
-  $trigger = New-ScheduledTaskTrigger -AtStartup
-  $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 `
-    -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-  Register-ScheduledTask -TaskName $Name -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
-  Start-ScheduledTask -TaskName $Name
-}
+Step 'Creating the scheduled tasks (auto-start with Windows, watchdog, daily backup)'
+$taskArgs = @{ Action = 'Install'; CaddyDir = $CaddyDir; BackupTime = $BackupTime; KeepBackups = $KeepBackups }
+if ($BackupDir) { $taskArgs.BackupDir = $BackupDir }
+& (Join-Path $PSScriptRoot 'tasks.ps1') @taskArgs
 
-Step 'Starting ORA ITSM (auto-start with Windows)'
-Register-StartupTask $AppTask $node '--env-file-if-exists=.env --disable-warning=ExperimentalWarning server\index.js' $AppDir
-$ok = $false
-for ($i = 0; $i -lt 30 -and -not $ok; $i++) {
-  Start-Sleep -Seconds 1
-  try { $ok = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/api/health" -TimeoutSec 3).StatusCode -eq 200 } catch { }
-}
-if (-not $ok) { throw "ORA ITSM did not start. Test it manually: cd $AppDir; npm start" }
-Write-Host 'ORA ITSM is running on port 8080 (local only)'
-
-Step 'Starting Caddy and requesting the SSL certificate (auto-start with Windows)'
-Register-StartupTask $CaddyTask $caddy "run --config `"$caddyfilePath`"" $CaddyDir
+Step "Checking https://$Domain (Caddy requests the SSL certificate on first start)"
 $ok = $false
 for ($i = 0; $i -lt 24 -and -not $ok; $i++) {
   Start-Sleep -Seconds 5
