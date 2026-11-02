@@ -241,7 +241,7 @@ function checkSla(tickets) {
 }
 
 // Called after time entries change: alert once per month when a usage threshold is crossed
-function checkAllowance(month, usedMinutes) {
+function checkAllowance(month, usedMinutes, period) {
   const settings = getSettings();
   const contract = (Number(settings.contract_hours_month) || 0) * 60;
   if (!contract) return;
@@ -256,7 +256,7 @@ function checkAllowance(month, usedMinutes) {
       intro: over
         ? `The ${esc(settings.contract_hours_month)} h included this month have been used. Further billable work will be counted as additional hours.`
         : `${esc(hours(usedMinutes))} of the ${esc(settings.contract_hours_month)} h monthly allowance have been used.`,
-      rows: [['Month', esc(month)], ['Used', `<b>${esc(hours(usedMinutes))}</b> (${Math.round(pct)}%)`], ['Allowance', `${esc(settings.contract_hours_month)} h`],
+      rows: [['Period', esc(period || month)], ['Used', `<b>${esc(hours(usedMinutes))}</b> (${Math.round(pct)}%)`], ['Allowance', `${esc(settings.contract_hours_month)} h`],
         ['Remaining', esc(hours(Math.max(0, contract - usedMinutes)))]],
       tone: over ? '#c42b1c' : '#a15c00',
     };

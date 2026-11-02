@@ -53,22 +53,44 @@ function ticketNumber(id, settings) {
   return `${settings.ticket_prefix || 'TCK'}-${String(id).padStart(5, '0')}`;
 }
 
-// UTC bounds of a local month 'YYYY-MM', using the client's UTC offset.
+// Contract periods ("months") run from the cycle day of a month to the cycle day of the next one.
+// With the default cycle day 6, period '2026-10' covers 06/10/2026 -> 05/11/2026 and closes on 06/11.
+function cycleDay(settings) {
+  const d = Math.round(Number(settings.contract_cycle_day));
+  return Number.isFinite(d) && d >= 1 && d <= 28 ? d : 1;
+}
+
+const isoDay = (y, m, d) => new Date(Date.UTC(y, m - 1, d)).toISOString().slice(0, 10);
+
+// UTC bounds of the contract period 'YYYY-MM', using the client's UTC offset.
 function monthRange(month, settings) {
   if (!/^\d{4}-\d{2}$/.test(month || '')) throw new HttpError(400, 'Invalid month (expected YYYY-MM)');
   const [y, m] = month.split('-').map(Number);
+  const day = cycleDay(settings);
   const offset = (settings.business_hours?.offset || 0) * 60000;
   return {
-    from: Date.UTC(y, m - 1, 1) - offset,
-    to: Date.UTC(y, m, 1) - offset,
-    dayFrom: `${month}-01`,
-    dayTo: new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10),
+    from: Date.UTC(y, m - 1, day) - offset,
+    to: Date.UTC(y, m, day) - offset,
+    dayFrom: isoDay(y, m, day),
+    dayTo: isoDay(y, m + 1, day),
+    // Last day included in the period (inclusive)
+    dayLast: isoDay(y, m + 1, day - 1),
   };
 }
 
-function currentMonth(settings) {
+// Contract period 'YYYY-MM' containing a local date 'YYYY-MM-DD'
+function periodOf(date, settings) {
+  const [y, m, d] = date.split('-').map(Number);
+  return d >= cycleDay(settings) ? date.slice(0, 7) : isoDay(y, m - 1, 1).slice(0, 7);
+}
+
+function todayLocal(settings) {
   const offset = (settings.business_hours?.offset || 0) * 60000;
-  return new Date(Date.now() + offset).toISOString().slice(0, 7);
+  return new Date(Date.now() + offset).toISOString().slice(0, 10);
+}
+
+function currentMonth(settings) {
+  return periodOf(todayLocal(settings), settings);
 }
 
 function decorate(t, pols, settings, now = Date.now()) {
@@ -468,11 +490,13 @@ app.delete('/api/attachments/:id', staff, wrap((req, res) => {
 // ---------- time tracking ----------
 
 function checkAllowance(workDate) {
-  const month = workDate.slice(0, 7);
-  const r = monthRange(month, getSettings());
+  const settings = getSettings();
+  const month = periodOf(workDate, settings);
+  const r = monthRange(month, settings);
   const used = db.prepare(`SELECT COALESCE(SUM(minutes),0) AS m FROM time_entries
     WHERE billable = 1 AND work_date >= ? AND work_date < ?`).get(r.dayFrom, r.dayTo).m;
-  notify.checkAllowance(month, used);
+  const fr = (d) => d.split('-').reverse().join('/');
+  notify.checkAllowance(month, used, `${fr(r.dayFrom)} – ${fr(r.dayLast)}`);
 }
 
 function validateEntry(b) {
@@ -542,7 +566,7 @@ function hoursByMonth(settings, months = 12) {
   return list.map((month) => {
     const r = monthRange(month, settings);
     const row = stmt.get(r.dayFrom, r.dayTo);
-    return { month, minutes: row.total, billable_minutes: row.billable };
+    return { month, period_from: r.dayFrom, period_to: r.dayLast, minutes: row.total, billable_minutes: row.billable };
   });
 }
 
@@ -567,15 +591,17 @@ app.get('/api/dashboard', wrap((req, res) => {
     ORDER BY t.updated_at DESC LIMIT 8`).all().map((t) => decorate(t, pols, settings, now));
   const mine = req.user.role === 'client' ? [] : open.filter((t) => t.assignee_id === req.user.id);
   const report = monthlyReport(month, settings);
-  // Linear projection of billable hours to the end of the month
-  const [y, m] = month.split('-').map(Number);
-  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  const today = Number(new Date(now + (settings.business_hours?.offset || 0) * 60000).toISOString().slice(8, 10));
+  // Linear projection of billable hours to the end of the contract period
+  const dayMs = 86400000;
+  const daysInPeriod = Math.round((Date.parse(r.dayTo) - Date.parse(r.dayFrom)) / dayMs);
+  const today = Math.round((Date.parse(todayLocal(settings)) - Date.parse(r.dayFrom)) / dayMs) + 1;
   res.json({
     month,
+    period_from: r.dayFrom,
+    period_to: r.dayLast,
     contract_minutes: (Number(settings.contract_hours_month) || 0) * 60,
     used_minutes: used,
-    projected_minutes: Math.round((used / Math.max(1, today)) * daysInMonth),
+    projected_minutes: Math.round((used / Math.max(1, today)) * daysInPeriod),
     open_count: open.length,
     created, resolved,
     by_priority: byPriority,
@@ -639,6 +665,8 @@ function monthlyReport(month, settings) {
 
   return {
     month,
+    period_from: r.dayFrom,
+    period_to: r.dayLast,
     settings: {
       company_name: settings.company_name, client_name: settings.client_name,
       contract_name: settings.contract_name, contract_hours_month: settings.contract_hours_month,
@@ -746,6 +774,10 @@ app.put('/api/settings', admin, wrap((req, res) => {
     if (key === 'contract_hours_month' || key === 'alert_threshold_pct') {
       v = Number(v);
       if (!Number.isFinite(v) || v < 0) throw new HttpError(400, `Invalid value: ${key}`);
+    }
+    if (key === 'contract_cycle_day') {
+      v = Number(v);
+      if (!Number.isInteger(v) || v < 1 || v > 28) throw new HttpError(400, 'Invalid cycle day (1-28)');
     }
     if (key === 'categories' && !Array.isArray(v)) throw new HttpError(400, 'Invalid categories');
     if (key === 'business_hours') {

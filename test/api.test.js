@@ -73,7 +73,9 @@ test('full flow: ticket, SLA, time, report', async () => {
   assert.strictEqual(t.sla_resolution, 'met');
   assert.strictEqual(t.time_minutes, 90);
 
-  const month = today.slice(0, 7);
+  // Contract periods close on the 6th: before the 6th, today belongs to the previous month's period
+  const [ty, tm, td] = today.split('-').map(Number);
+  const month = new Date(Date.UTC(ty, tm - 1 - (td < 6 ? 1 : 0), 1)).toISOString().slice(0, 7);
   const rep = (await call('GET', `/reports/monthly?month=${month}`)).body;
   assert.strictEqual(rep.hours.billable_minutes, 90);
   assert.strictEqual(rep.hours.non_billable_minutes, 60);
@@ -88,6 +90,22 @@ test('full flow: ticket, SLA, time, report', async () => {
   const dash = (await call('GET', '/dashboard')).body;
   assert.strictEqual(dash.used_minutes, 90);
   assert.strictEqual(dash.contract_minutes, 2400);
+  assert.strictEqual(dash.month, month);
+  assert.ok(dash.period_from <= today && today <= dash.period_to);
+});
+
+test('contract periods run from the 6th to the 5th of the next month', async () => {
+  const p = (await call('GET', '/reports/monthly?month=2025-12')).body;
+  assert.strictEqual(p.period_from, '2025-12-06');
+  assert.strictEqual(p.period_to, '2026-01-05');
+  const sum = async (m) => (await call('GET', `/reports/monthly?month=${m}`)).body.hours.billable_minutes;
+  const before = { nov: await sum('2025-11'), dec: await sum('2025-12') };
+  assert.strictEqual((await call('POST', '/time', { work_date: '2025-12-05', minutes: 30, description: 'Closing day -1' })).status, 201);
+  assert.strictEqual((await call('POST', '/time', { work_date: '2025-12-06', minutes: 45, description: 'New period' })).status, 201);
+  assert.strictEqual((await call('POST', '/time', { work_date: '2026-01-05', minutes: 15, description: 'Last day' })).status, 201);
+  assert.strictEqual(await sum('2025-11'), before.nov + 30);
+  assert.strictEqual(await sum('2025-12'), before.dec + 60);
+  assert.strictEqual((await call('PUT', '/settings', { contract_cycle_day: 31 })).status, 400);
 });
 
 test('attachments, backup and permissions', async () => {

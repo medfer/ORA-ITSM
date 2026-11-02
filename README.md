@@ -238,7 +238,8 @@ docker compose exec ora-itsm node server/add-user.js it@ora.iq 'OraClient!2026' 
 - **First response**: first move out of "New", or first public reply from an engineer.
 - **Resolution**: move to "Resolved", "Closed" or "Cancelled". Reopening a ticket clears the resolution date.
 - **SLA pause**: time spent in "Pending client" extends the resolution due date. "Pending Microsoft" does not pause (provider commitment).
-- **Allowance**: only *billable* entries count against the 40 h; the month is taken from the work date.
+- **Allowance**: only *billable* entries count against the 40 h; the contract period is taken from the work date.
+- **Contract periods**: each monthly period closes on the **6th** — e.g. the *October* period covers 06/10 → 05/11 and closes on 06/11. The closing day is configurable in *Settings → Contract* (1–28).
 - **Monthly SLA compliance**: response = tickets created in the month whose first response is met or breached; resolution = tickets resolved in the month.
 
 ## Default SLA (editable in Settings)

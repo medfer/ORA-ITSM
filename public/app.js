@@ -115,13 +115,24 @@ function todayLocal() {
   return new Date(Date.now() + offsetMs()).toISOString().slice(0, 10);
 }
 
+// Contract periods run from the cycle day of a month to the day before it in the next month
+// (default 6: period '2026-10' = 06/10/2026 -> 05/11/2026, closed on 06/11).
+function cycleDay() {
+  const d = Math.round(Number(state.meta?.settings?.contract_cycle_day));
+  return Number.isFinite(d) && d >= 1 && d <= 28 ? d : 1;
+}
+
 function currentMonth() {
-  return todayLocal().slice(0, 7);
+  const today = todayLocal();
+  return Number(today.slice(8, 10)) >= cycleDay() ? today.slice(0, 7) : shiftMonth(today.slice(0, 7), -1);
 }
 
 function monthLabel(month) {
   const [y, m] = month.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  const day = cycleDay();
+  if (day === 1) return new Date(Date.UTC(y, m - 1, 1)).toLocaleDateString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  const f = (d) => d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'UTC' });
+  return `${f(new Date(Date.UTC(y, m - 1, day)))} – ${f(new Date(Date.UTC(y, m, day - 1)))}`;
 }
 
 function shiftMonth(month, delta) {
@@ -1310,6 +1321,7 @@ async function renderSettings() {
           <label>Usage alert (%)<input name="alert_threshold_pct" type="number" min="1" max="100" value="${esc(s.alert_threshold_pct)}"></label>
           <label>Ticket prefix<input name="ticket_prefix" value="${esc(s.ticket_prefix)}" maxlength="10"></label>
           <label>Contract start<input name="contract_start" type="month" value="${esc(s.contract_start)}"></label>
+          <label>Monthly closing day <span class="hint">— each period runs from this day to the day before it next month</span><input name="contract_cycle_day" type="number" min="1" max="28" step="1" value="${esc(s.contract_cycle_day)}"></label>
           <label class="full">Categories (one per line)<textarea name="categories" rows="6">${esc((s.categories || []).join('\n'))}</textarea></label>
           <div class="foot full"><button class="btn primary" type="submit">Save</button></div>
         </form></div>
@@ -1439,6 +1451,7 @@ async function renderSettings() {
     e.preventDefault();
     const d = Object.fromEntries(new FormData(e.target));
     d.categories = d.categories.split('\n').map((c) => c.trim()).filter(Boolean);
+    d.contract_cycle_day = Number(d.contract_cycle_day);
     try {
       await api('/settings', { method: 'PUT', body: d });
       await refreshMeta();

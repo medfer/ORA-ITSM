@@ -142,6 +142,8 @@ const DEFAULT_SETTINGS = {
   client_name: 'ORA',
   contract_name: 'ORA Microsoft Support',
   contract_hours_month: 40,
+  // Day of the month on which each contract period starts and the previous one closes (1-28)
+  contract_cycle_day: 6,
   contract_start: new Date().toISOString().slice(0, 7),
   ticket_prefix: 'ORA',
   alert_threshold_pct: 80,
